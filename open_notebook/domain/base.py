@@ -193,12 +193,31 @@ class ObjectModel(BaseModel):
             raise DatabaseOperationError(e)
 
     def _prepare_save_data(self) -> Dict[str, Any]:
+        from surrealdb import RecordID  # type: ignore
+
         data = self.model_dump()
-        return {
+        result = {
             key: value
             for key, value in data.items()
             if value is not None or key in self.__class__.nullable_fields
         }
+        # Convert any *_id field that holds a "table:key" string into a proper
+        # RecordID so SurrealDB schema type checks (option<record<table>>)
+        # accept it.  We only do this for fields whose name ends in "_id"
+        # (excluding the bare "id" field) to avoid accidentally converting
+        # timestamps or other colon-containing strings.
+        for key, value in result.items():
+            if (
+                key != "id"
+                and key.endswith("_id")
+                and isinstance(value, str)
+                and value.count(":") == 1
+            ):
+                try:
+                    result[key] = RecordID.parse(value)
+                except Exception:
+                    pass  # leave as-is if it doesn't parse cleanly
+        return result
 
     async def delete(self) -> bool:
         if self.id is None:
