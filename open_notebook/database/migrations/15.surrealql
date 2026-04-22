@@ -1,0 +1,28 @@
+-- Migration 15: Multi-user support
+-- Adds user table, user_id fields to core tables, and SharePoint connection table
+
+-- USER TABLE
+DEFINE TABLE IF NOT EXISTS user SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS email ON TABLE user TYPE string;
+DEFINE FIELD IF NOT EXISTS password_hash ON TABLE user TYPE string;
+DEFINE FIELD IF NOT EXISTS name ON TABLE user TYPE string;
+DEFINE FIELD IF NOT EXISTS role ON TABLE user TYPE string DEFAULT 'user';
+DEFINE FIELD IF NOT EXISTS created ON TABLE user TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS updated ON TABLE user TYPE option<datetime>;
+DEFINE INDEX IF NOT EXISTS user_email_unique ON TABLE user COLUMNS email UNIQUE;
+
+-- Add user_id to core tables (optional for backward compat with existing records)
+DEFINE FIELD IF NOT EXISTS user_id ON TABLE notebook TYPE option<record<user>>;
+DEFINE FIELD IF NOT EXISTS user_id ON TABLE source TYPE option<record<user>>;
+DEFINE FIELD IF NOT EXISTS user_id ON TABLE note TYPE option<record<user>>;
+DEFINE FIELD IF NOT EXISTS user_id ON TABLE chat_session TYPE option<record<user>>;
+
+-- SHAREPOINT CONNECTION TABLE
+DEFINE TABLE IF NOT EXISTS sharepoint_connection SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS user_id ON TABLE sharepoint_connection TYPE record<user>;
+DEFINE FIELD IF NOT EXISTS site_url ON TABLE sharepoint_connection TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS folder_path ON TABLE sharepoint_connection TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS connected ON TABLE sharepoint_connection TYPE bool DEFAULT false;
+DEFINE FIELD IF NOT EXISTS created ON TABLE sharepoint_connection TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS updated ON TABLE sharepoint_connection TYPE option<datetime>;
+DEFINE INDEX IF NOT EXISTS sharepoint_user_unique ON TABLE sharepoint_connection COLUMNS user_id UNIQUE;

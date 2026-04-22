@@ -1,0 +1,12 @@
+-- Migration 15 rollback: Remove multi-user support
+
+REMOVE INDEX IF EXISTS user_email_unique ON TABLE user;
+REMOVE TABLE IF EXISTS user;
+
+REMOVE FIELD IF EXISTS user_id ON TABLE notebook;
+REMOVE FIELD IF EXISTS user_id ON TABLE source;
+REMOVE FIELD IF EXISTS user_id ON TABLE note;
+REMOVE FIELD IF EXISTS user_id ON TABLE chat_session;
+
+REMOVE INDEX IF EXISTS sharepoint_user_unique ON TABLE sharepoint_connection;
+REMOVE TABLE IF EXISTS sharepoint_connection;
