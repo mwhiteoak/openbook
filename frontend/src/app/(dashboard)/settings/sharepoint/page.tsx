@@ -160,7 +160,7 @@ export default function SharePointPage() {
                   </CardTitle>
                   <CardDescription>
                     {connection?.connected
-                      ? t('sharepoint.connectedTo').replace('{siteUrl}', connection.site_url)
+                      ? t('sharepoint.connectedTo').replace('{siteUrl}', connection.site_url ?? '')
                       : t('sharepoint.notConnected')}
                   </CardDescription>
                 </div>
