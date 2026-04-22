@@ -1,3 +1,4 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -18,12 +19,73 @@ def get_database_url():
     # Fallback to old format - WebSocket URL format
     address = os.getenv("SURREAL_ADDRESS", "localhost")
     port = os.getenv("SURREAL_PORT", "8000")
-    return f"ws://{address}/rpc:{port}"
+    return f"ws://{address}:{port}/rpc"
 
 
 def get_database_password():
     """Get password with backward compatibility"""
     return os.getenv("SURREAL_PASSWORD") or os.getenv("SURREAL_PASS")
+
+
+# ---------------------------------------------------------------------------
+# Connection pool
+# ---------------------------------------------------------------------------
+_POOL_SIZE = int(os.getenv("SURREAL_POOL_SIZE", "5"))
+_pool: Optional[asyncio.Queue] = None
+_pool_lock: Optional[asyncio.Lock] = None
+
+
+async def _create_authenticated_connection() -> AsyncSurreal:
+    db = AsyncSurreal(get_database_url())
+    await db.signin(
+        {
+            "username": os.environ.get("SURREAL_USER"),
+            "password": get_database_password(),
+        }
+    )
+    await db.use(
+        os.environ.get("SURREAL_NAMESPACE"), os.environ.get("SURREAL_DATABASE")
+    )
+    return db
+
+
+async def _get_pool() -> asyncio.Queue:
+    """Return the pool, creating it lazily on first call."""
+    global _pool, _pool_lock
+
+    # Fast path – pool already ready
+    if _pool is not None:
+        return _pool
+
+    # Lazy-init lock (must be created inside a running event loop)
+    if _pool_lock is None:
+        _pool_lock = asyncio.Lock()
+
+    async with _pool_lock:
+        if _pool is not None:          # Another coroutine beat us here
+            return _pool
+        q: asyncio.Queue = asyncio.Queue(maxsize=_POOL_SIZE)
+        for _ in range(_POOL_SIZE):
+            conn = await _create_authenticated_connection()
+            q.put_nowait(conn)
+        _pool = q
+        logger.info(f"SurrealDB connection pool ready ({_POOL_SIZE} connections)")
+    return _pool
+
+
+async def close_connection_pool() -> None:
+    """Close all pooled connections (call on application shutdown)."""
+    global _pool
+    if _pool is None:
+        return
+    while not _pool.empty():
+        try:
+            conn = _pool.get_nowait()
+            await conn.close()
+        except Exception:
+            pass
+    _pool = None
+    logger.info("SurrealDB connection pool closed")
 
 
 def parse_record_ids(obj: Any) -> Any:
@@ -46,20 +108,47 @@ def ensure_record_id(value: Union[str, RecordID]) -> RecordID:
 
 @asynccontextmanager
 async def db_connection():
-    db = AsyncSurreal(get_database_url())
-    await db.signin(
-        {
-            "username": os.environ.get("SURREAL_USER"),
-            "password": get_database_password(),
-        }
-    )
-    await db.use(
-        os.environ.get("SURREAL_NAMESPACE"), os.environ.get("SURREAL_DATABASE")
-    )
+    """Borrow an authenticated connection from the pool.
+
+    On error the connection is replaced so the pool stays healthy.
+    If the pool hasn't been created yet it is initialised on first call.
+    """
+    pool = await _get_pool()
+
+    # Wait (up to 30 s) for a connection to become available
     try:
-        yield db
+        conn = await asyncio.wait_for(pool.get(), timeout=30)
+    except asyncio.TimeoutError:
+        logger.warning("Connection pool exhausted; creating a temporary connection")
+        conn = await _create_authenticated_connection()
+        try:
+            yield conn
+        finally:
+            await conn.close()
+        return
+
+    healthy = True
+    try:
+        yield conn
+    except Exception:
+        healthy = False
+        raise
     finally:
-        await db.close()
+        if healthy:
+            try:
+                pool.put_nowait(conn)
+            except asyncio.QueueFull:
+                await conn.close()
+        else:
+            # Replace the potentially-broken connection
+            try:
+                await conn.close()
+            except Exception:
+                pass
+            try:
+                pool.put_nowait(await _create_authenticated_connection())
+            except Exception:
+                pass  # Pool shrinks by one; not fatal
 
 
 async def repo_query(

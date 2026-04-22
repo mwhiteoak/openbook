@@ -221,7 +221,9 @@ async def lifespan(app: FastAPI):
     # Yield control to the application
     yield
 
-    # Shutdown: cleanup if needed
+    # Shutdown: close connection pool
+    from open_notebook.database.repository import close_connection_pool
+    await close_connection_pool()
     logger.info("API shutdown complete")
 
 
