@@ -189,4 +189,28 @@
   .clickable-card * {
     cursor: pointer !important;
   }
+
+  /* Chat "thinking" shimmer — sweeps a subtle gradient across the status
+     text while the model composes its reply. Paired with a short fade-in so
+     each rotated message slides in softly rather than snapping. */
+  @keyframes thinking-shimmer {
+    0% {
+      background-position: 200% 0;
+      opacity: 0;
+      transform: translateY(2px);
+    }
+    15% {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    100% {
+      background-position: -200% 0;
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .animate-thinking-shimmer {
+    animation: thinking-shimmer 2.6s ease-in-out infinite;
+  }
 }

@@ -64,6 +64,11 @@ class Credential(ObjectModel):
     project: Optional[str] = None
     location: Optional[str] = None
     credentials_path: Optional[str] = None
+    # Operational state: set automatically when a connection test fails with an
+    # auth error.  UI filters `disabled=True` credentials out of selection
+    # dropdowns; /test success re-enables the credential.
+    disabled: bool = False
+    last_test_message: Optional[str] = None
 
     def to_esperanto_config(self) -> Dict[str, Any]:
         """

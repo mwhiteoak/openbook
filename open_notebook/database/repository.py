@@ -33,6 +33,7 @@ def get_database_password():
 _POOL_SIZE = int(os.getenv("SURREAL_POOL_SIZE", "5"))
 _pool: Optional[asyncio.Queue] = None
 _pool_lock: Optional[asyncio.Lock] = None
+_pool_loop_id: Optional[int] = None  # id() of the event loop that owns the pool
 
 
 async def _create_authenticated_connection() -> AsyncSurreal:
@@ -51,7 +52,7 @@ async def _create_authenticated_connection() -> AsyncSurreal:
 
 async def _get_pool() -> asyncio.Queue:
     """Return the pool, creating it lazily on first call."""
-    global _pool, _pool_lock
+    global _pool, _pool_lock, _pool_loop_id
 
     # Fast path – pool already ready
     if _pool is not None:
@@ -65,6 +66,7 @@ async def _get_pool() -> asyncio.Queue:
         if _pool is not None:          # Another coroutine beat us here
             return _pool
         q: asyncio.Queue = asyncio.Queue(maxsize=_POOL_SIZE)
+        _pool_loop_id = id(asyncio.get_running_loop())  # Remember which loop owns the pool
         for _ in range(_POOL_SIZE):
             conn = await _create_authenticated_connection()
             q.put_nowait(conn)
@@ -75,7 +77,7 @@ async def _get_pool() -> asyncio.Queue:
 
 async def close_connection_pool() -> None:
     """Close all pooled connections (call on application shutdown)."""
-    global _pool
+    global _pool, _pool_loop_id
     if _pool is None:
         return
     while not _pool.empty():
@@ -85,6 +87,7 @@ async def close_connection_pool() -> None:
         except Exception:
             pass
     _pool = None
+    _pool_loop_id = None
     logger.info("SurrealDB connection pool closed")
 
 
@@ -110,9 +113,50 @@ def ensure_record_id(value: Union[str, RecordID]) -> RecordID:
 async def db_connection():
     """Borrow an authenticated connection from the pool.
 
+    When called from the same event loop that owns the pool, a pooled connection
+    is reused.  When called from a *different* event loop (e.g. from asyncio.run()
+    inside a worker thread), the pool connections cannot be safely shared because
+    their internal websocket tasks are bound to the original loop.  In that case a
+    fresh, temporary connection is created and closed after the request completes.
+
     On error the connection is replaced so the pool stays healthy.
-    If the pool hasn't been created yet it is initialised on first call.
     """
+    # Detect whether we are running in the pool's event loop.
+    try:
+        current_loop_id = id(asyncio.get_running_loop())
+    except RuntimeError:
+        current_loop_id = None
+
+    # Only take the one-shot fallback when the pool already exists AND we are
+    # in a *different* event loop (e.g. called from asyncio.run() in a worker
+    # thread — pooled websocket tasks are bound to the original loop and
+    # can't be shared).
+    #
+    # Previously this branch also fired when `_pool is None`, which meant
+    # that in a fresh process (like the API at request-time) the pool never
+    # got a chance to spin up: every request created and closed a fresh
+    # authenticated websocket connection (~1.5–2s per query) instead of
+    # reusing pooled connections (~15ms). `_get_pool()` below handles lazy
+    # creation safely with its own lock.
+    cross_loop = (
+        _pool is not None
+        and _pool_loop_id is not None
+        and current_loop_id is not None
+        and current_loop_id != _pool_loop_id
+    )
+
+    if cross_loop:
+        # Different event loop – create a fresh connection for this request only.
+        conn = await _create_authenticated_connection()
+        try:
+            yield conn
+        finally:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+        return
+
     pool = await _get_pool()
 
     # Wait (up to 30 s) for a connection to become available

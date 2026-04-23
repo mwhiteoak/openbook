@@ -31,8 +31,11 @@ export function ModelSelector({
   const derivedId = useId()
   const selectId = id || derivedId
 
-  // Filter models by type
-  const filteredModels = models?.filter(model => model.type === modelType) || []
+  // Filter models by type; hide models whose backing credential has been
+  // auto-disabled by a failed connection test. Users can re-enable the
+  // credential from the API Keys page; until then the model is unselectable.
+  const filteredModels =
+    models?.filter((model) => model.type === modelType && !model.credential_disabled) || []
   return (
     <div className="space-y-2">
       {label && <Label htmlFor={selectId}>{label}</Label>}

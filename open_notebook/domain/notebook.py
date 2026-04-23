@@ -1,5 +1,6 @@
 import asyncio
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
@@ -15,10 +16,27 @@ from open_notebook.exceptions import DatabaseOperationError, InvalidInputError
 
 class Notebook(ObjectModel):
     table_name: ClassVar[str] = "notebook"
+    # ``running_summary_updated`` is stored in the DB but empty on brand-new
+    # notebooks. Declare it nullable so Pydantic doesn't choke when the row
+    # comes back with None.
+    nullable_fields: ClassVar[set[str]] = {
+        "user_id",
+        "running_summary",
+        "running_summary_updated",
+    }
     name: str
     description: str
     archived: Optional[bool] = False
     user_id: Optional[str] = None
+    # Compact LLM-maintained summary of the notebook's activity — fed into
+    # the chat system prompt so the model retains long-term context across
+    # sessions. Populated lazily by ``maybe_refresh_running_summary``; old
+    # notebooks stay at None until their first chat turn lands.
+    running_summary: Optional[str] = None
+    running_summary_updated: Optional[datetime] = None
+    # Chat-message count already folded into ``running_summary`` — used to
+    # throttle refreshes (don't re-summarize on every turn).
+    running_summary_msg_count: int = 0
 
     @field_validator("name")
     @classmethod
@@ -286,6 +304,54 @@ class SourceInsight(ObjectModel):
         return note
 
 
+# Named stages for the ingestion progress bar. The UI renders these as
+# i18n keys (``sources.stage<Name>``), so additions here must be matched
+# in the locale files.
+INGESTION_STAGES = (
+    "queued",
+    "extracting",
+    "embedding",
+    "transforming",
+    "completed",
+    "failed",
+)
+
+
+def _compute_ingestion_progress(
+    *,
+    command_status: Optional[str],
+    has_full_text: bool,
+    embedded_chunks: int,
+    insights_count: int,
+) -> Tuple[str, int]:
+    """Derive (stage, progress 0-100) from observable source state.
+
+    Pure function — no DB access. The caller is responsible for fetching
+    the inputs. See ``Source.get_processing_progress`` for the live wiring.
+
+    Progress values are non-linear on purpose: they mark visible state
+    transitions rather than time elapsed. When a user sees the bar jump
+    from 25% → 55%, it's because the extracted text just landed in the DB,
+    which is what they'd want to know.
+    """
+    if command_status == "completed":
+        return "completed", 100
+    if command_status == "failed":
+        return "failed", 0
+    if command_status in (None, "queued", "new"):
+        return "queued", 5
+    # Anything else (running, unknown) — infer from side-effect state.
+    if not has_full_text:
+        return "extracting", 25
+    if embedded_chunks <= 0:
+        return "embedding", 55
+    if insights_count <= 0:
+        return "transforming", 85
+    # Chunks + at least one insight present but the job hasn't flipped to
+    # completed yet — we're in the tail, likely finalizing metadata.
+    return "transforming", 95
+
+
 class Source(ObjectModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -332,7 +398,22 @@ class Source(ObjectModel):
             return "unknown"
 
     async def get_processing_progress(self) -> Optional[Dict[str, Any]]:
-        """Get detailed processing information for the associated command"""
+        """Get detailed processing information for the associated command.
+
+        The returned ``progress`` (0–100) and ``stage`` fields are derived
+        from observable source state — we don't have fine-grained
+        instrumentation in the source graph, but we can infer where a
+        running job is from three signals:
+
+          1. Is ``full_text`` populated? → extraction finished.
+          2. Are there ``source_embedding`` rows? → embedding finished.
+          3. Are there ``source_insight`` rows? → transformations running/done.
+
+        The numbers are deliberately non-linear (5/25/55/85/100) because
+        perceived progress tracks visible state changes, not wall-clock
+        time. Users reliably see the bar jump when a stage flips, which
+        feels honest.
+        """
         if not self.command:
             return None
 
@@ -349,8 +430,43 @@ class Source(ObjectModel):
                 result.get("execution_metadata", {}) if isinstance(result, dict) else {}
             )
 
+            command_status = status_result.status
+
+            # Derive a coarse stage+progress from command state + source fields.
+            # ``_compute_ingestion_progress`` is intentionally a pure helper so
+            # tests can exercise every branch without hitting the DB.
+            chunks = 0
+            insights = 0
+            if command_status in {"running", "completed"}:
+                # Only query chunk/insight counts when the job is actually
+                # mid-flight or done — skipping for queued/failed jobs saves
+                # two queries per poll for the common "nothing happening yet"
+                # case.
+                try:
+                    chunks = await self.get_embedded_chunks()
+                except Exception:
+                    chunks = 0
+                try:
+                    insight_rows = await repo_query(
+                        "SELECT count() AS n FROM source_insight WHERE source=$id GROUP ALL",
+                        {"id": ensure_record_id(self.id)},
+                    )
+                    if insight_rows:
+                        insights = int(insight_rows[0].get("n") or 0)
+                except Exception:
+                    insights = 0
+
+            stage, progress = _compute_ingestion_progress(
+                command_status=command_status,
+                has_full_text=bool(self.full_text and self.full_text.strip()),
+                embedded_chunks=chunks,
+                insights_count=insights,
+            )
+
             return {
-                "status": status_result.status,
+                "status": command_status,
+                "stage": stage,
+                "progress": progress,
                 "started_at": execution_metadata.get("started_at"),
                 "completed_at": execution_metadata.get("completed_at"),
                 "error": getattr(status_result, "error_message", None),

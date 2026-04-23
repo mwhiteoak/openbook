@@ -3,6 +3,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --------------------------------------------------------------------------- #
+# bcrypt 5.x compatibility shim for passlib.                                   #
+# passlib.handlers.bcrypt reads bcrypt.__about__.__version__ at import time;  #
+# bcrypt 5 removed __about__ and passlib logs "(trapped) error reading bcrypt #
+# version" on every process start / login.  Restore the attribute so the      #
+# warning never fires.  Harmless no-op on older bcrypt.                       #
+# --------------------------------------------------------------------------- #
+try:
+    import bcrypt  # type: ignore
+
+    if not hasattr(bcrypt, "__about__"):
+        _bcrypt_version = getattr(bcrypt, "__version__", "0.0.0")
+        bcrypt.__about__ = type(  # type: ignore[attr-defined]
+            "_About", (), {"__version__": _bcrypt_version}
+        )()
+except Exception:
+    # bcrypt isn't installed, or a future version exposes __about__ again —
+    # either way we don't want this shim to block startup.
+    pass
+
 import os
 from contextlib import asynccontextmanager
 
@@ -215,6 +235,58 @@ async def lifespan(app: FastAPI):
             logger.info("No ANTHROPIC_API_KEY found, skipping auto-model setup")
     except Exception as e:
         logger.warning(f"Auto-configuring default model failed (non-fatal): {e}")
+
+    # Fix model types that were incorrectly stored as 'language' due to a
+    # registration bug (all discovered OpenAI models defaulted to 'language').
+    # This corrects existing records based on well-known name patterns.
+    #
+    # Gated behind a meta flag so it only runs once: every subsequent startup
+    # sees the flag and skips the full scan + Python-side pattern matching,
+    # saving ~200–500ms on boot.
+    try:
+        from api.credentials_service import infer_model_type
+        from open_notebook.database.repository import ensure_record_id, repo_query
+
+        # Meta table row: `meta:model_type_fixup` with `done: bool, version: int`.
+        # If we ever change the inference rules, bump FIXUP_VERSION to re-run.
+        FIXUP_VERSION = 1
+
+        flag_rows = await repo_query(
+            "SELECT done, version FROM meta:model_type_fixup"
+        )
+        flag = flag_rows[0] if flag_rows else {}
+        already_done = bool(flag.get("done")) and int(flag.get("version") or 0) >= FIXUP_VERSION
+
+        if already_done:
+            logger.info("Model type fixup: already applied, skipping scan")
+        else:
+            all_lang_models = await repo_query(
+                "SELECT id, name, provider, type FROM model WHERE type = 'language'"
+            )
+            fixed = 0
+            for m in all_lang_models:
+                correct_type = infer_model_type(m.get("name", ""), m.get("provider", ""))
+                if correct_type != "language":
+                    await repo_query(
+                        "UPDATE $id SET type = $type",
+                        {"id": ensure_record_id(m["id"]), "type": correct_type},
+                    )
+                    fixed += 1
+
+            if fixed:
+                logger.success(
+                    f"Model type fixup: corrected {fixed} model record(s) to their proper types"
+                )
+            else:
+                logger.info("Model type fixup: all model types already correct")
+
+            # Record completion so we don't scan again next boot
+            await repo_query(
+                "UPSERT meta:model_type_fixup CONTENT { done: true, version: $v }",
+                {"v": FIXUP_VERSION},
+            )
+    except Exception as e:
+        logger.warning(f"Model type fixup failed (non-fatal): {e}")
 
     logger.success("API initialization completed successfully")
 

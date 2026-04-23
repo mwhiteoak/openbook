@@ -59,6 +59,53 @@ export const chatApi = {
     return response.data
   },
 
+  // Messaging with SSE streaming. Returns the raw ReadableStream body;
+  // callers are responsible for reading/decoding chunks and parsing the
+  // `data: { ... }\n\n` framing. Mirrors sourceChatApi.sendMessage's pattern
+  // for Docker compatibility (relative URL, manual auth header).
+  streamMessage: (data: SendNotebookChatMessageRequest) => {
+    let token: string | null = null
+    if (typeof window !== 'undefined') {
+      const authStorage = localStorage.getItem('auth-storage')
+      if (authStorage) {
+        try {
+          const { state } = JSON.parse(authStorage)
+          if (state?.token) {
+            token = state.token
+          }
+        } catch (error) {
+          console.error('Error parsing auth storage:', error)
+        }
+      }
+    }
+
+    const url = '/api/chat/execute/stream'
+
+    return fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token && { Authorization: `Bearer ${token}` }),
+      },
+      body: JSON.stringify(data),
+    }).then(async (response) => {
+      if (!response.ok) {
+        let errorMessage = `HTTP error! status: ${response.status}`
+        try {
+          const errorData = await response.json()
+          errorMessage = errorData.detail || errorData.message || errorMessage
+        } catch {
+          errorMessage = response.statusText || errorMessage
+        }
+        throw new Error(errorMessage)
+      }
+      if (!response.body) {
+        throw new Error('No response body received')
+      }
+      return response.body
+    })
+  },
+
   buildContext: async (data: BuildContextRequest) => {
     const response = await apiClient.post<BuildContextResponse>(
       `/chat/context`,

@@ -242,6 +242,16 @@ async def update_credential(credential_id: str, request: UpdateCredentialRequest
             cred.credentials_path = request.credentials_path or None
 
         await cred.save()
+
+        # Invalidate the provisioned-model cache — any previously cached
+        # LangChain client pinned to this credential may now have a new key
+        # or endpoint.
+        try:
+            from open_notebook.ai.provision import invalidate_model_cache
+            invalidate_model_cache()
+        except Exception:
+            pass
+
         models = await cred.get_linked_models()
         return credential_to_response(cred, len(models))
 
@@ -333,6 +343,13 @@ async def delete_credential(
         # Delete the credential
         await cred.delete()
 
+        # Invalidate the provisioned-model cache
+        try:
+            from open_notebook.ai.provision import invalidate_model_cache
+            invalidate_model_cache()
+        except Exception:
+            pass
+
         return CredentialDeleteResponse(
             message="Credential deleted successfully",
             deleted_models=deleted_models,
@@ -374,6 +391,7 @@ async def discover_models_for_credential(credential_id: str):
                     name=d["name"],
                     provider=d["provider"],
                     description=d.get("description"),
+                    model_type=d.get("model_type"),
                 )
                 for d in discovered
             ],

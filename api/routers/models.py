@@ -177,6 +177,20 @@ async def get_models(
         else:
             models = await Model.get_all()
 
+        # Load a single map of disabled credentials so the UI can grey-out
+        # models whose backing credential has been auto-disabled by a failed
+        # /test call. This is one extra query per /models fetch, not per row.
+        disabled_credentials: set[str] = set()
+        try:
+            all_credentials = await Credential.get_all()
+            disabled_credentials = {
+                str(cred.id) for cred in all_credentials if getattr(cred, "disabled", False)
+            }
+        except Exception as cred_err:
+            logger.warning(
+                f"Failed to resolve disabled credentials for /models: {cred_err}"
+            )
+
         return [
             ModelResponse(
                 id=model.id,
@@ -184,6 +198,10 @@ async def get_models(
                 provider=model.provider,
                 type=model.type,
                 credential=model.credential,
+                credential_disabled=(
+                    bool(model.credential)
+                    and str(model.credential) in disabled_credentials
+                ),
                 created=str(model.created),
                 updated=str(model.updated),
             )
@@ -258,6 +276,13 @@ async def delete_model(model_id: str):
             raise HTTPException(status_code=404, detail="Model not found")
 
         await model.delete()
+
+        # Drop provisioned-model cache; a cached entry for this model is stale
+        try:
+            from open_notebook.ai.provision import invalidate_model_cache
+            invalidate_model_cache()
+        except Exception:
+            pass
 
         return {"message": "Model deleted successfully"}
     except HTTPException:
@@ -342,7 +367,12 @@ async def update_default_models(defaults_data: DefaultModelsResponse):
 
         await defaults.update()
 
-        # No cache refresh needed - next access will fetch fresh data from DB
+        # Drop provisioned-model cache so the next request picks up new defaults
+        try:
+            from open_notebook.ai.provision import invalidate_model_cache
+            invalidate_model_cache()
+        except Exception:
+            pass
 
         return DefaultModelsResponse(
             default_chat_model=defaults.default_chat_model,  # type: ignore[attr-defined]

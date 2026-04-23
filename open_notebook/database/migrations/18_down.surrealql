@@ -1,0 +1,5 @@
+-- Rollback migration 18: drop the notebook running-summary fields.
+
+REMOVE FIELD IF EXISTS running_summary ON TABLE notebook;
+REMOVE FIELD IF EXISTS running_summary_updated ON TABLE notebook;
+REMOVE FIELD IF EXISTS running_summary_msg_count ON TABLE notebook;

@@ -45,13 +45,14 @@ export function ModelSelector({
     setSelectedModel(currentModel || 'default')
   }, [currentModel])
 
-  // Filter for language models only and sort by name
+  // Filter for language models only; hide models whose backing credential
+  // has been auto-disabled by a failed connection test, then sort by name.
   const languageModels = useMemo(() => {
     if (!models) {
       return []
     }
     return [...models]
-      .filter((model) => model.type === 'language')
+      .filter((model) => model.type === 'language' && !model.credential_disabled)
       .sort((a, b) => a.name.localeCompare(b.name))
   }, [models])
 

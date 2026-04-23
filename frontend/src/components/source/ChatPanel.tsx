@@ -7,18 +7,20 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
-import { Bot, User, Send, Loader2, FileText, Lightbulb, StickyNote, Clock } from 'lucide-react'
+import { Bot, User, Send, FileText, Lightbulb, StickyNote, Clock, Zap, RefreshCw, Search } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import {
   SourceChatMessage,
   SourceChatContextIndicator,
-  BaseChatSession
+  BaseChatSession,
+  RetrievalSource
 } from '@/lib/types/api'
 import { ModelSelector } from './ModelSelector'
 import { ContextIndicator } from '@/components/common/ContextIndicator'
 import { SessionManager } from '@/components/source/SessionManager'
 import { MessageActions } from '@/components/source/MessageActions'
+import { ThinkingIndicator } from '@/components/common/ThinkingIndicator'
 import { convertReferencesToCompactMarkdown, createCompactReferenceLinkComponent } from '@/lib/utils/source-references'
 import { useModalManager } from '@/lib/hooks/use-modal-manager'
 import { toast } from 'sonner'
@@ -37,6 +39,9 @@ interface ChatPanelProps {
   isStreaming: boolean
   contextIndicators: SourceChatContextIndicator | null
   onSendMessage: (message: string, modelOverride?: string) => void
+  // Re-run the LLM for a cached answer (bypass_cache=true on the server).
+  // Optional — pages that don't support caching can omit it.
+  onRegenerateMessage?: (messageId: string) => void
   modelOverride?: string
   onModelChange?: (model?: string) => void
   // Session management props
@@ -61,6 +66,7 @@ export function ChatPanel({
   isStreaming,
   contextIndicators,
   onSendMessage,
+  onRegenerateMessage,
   modelOverride,
   onModelChange,
   sessions = [],
@@ -184,12 +190,30 @@ export function ChatPanel({
                 >
                   {message.type === 'ai' && (
                     <div className="flex-shrink-0">
-                      <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center">
+                      {/* Softly pulse the Bot avatar while this bubble is
+                          actively streaming — gives the sense that the model
+                          is "alive" without being distracting. */}
+                      <div
+                        className={`h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center transition-all ${
+                          message.isStreaming ? 'ring-2 ring-primary/30 animate-pulse motion-reduce:animate-none' : ''
+                        }`}
+                      >
                         <Bot className="h-4 w-4" />
                       </div>
                     </div>
                   )}
                   <div className="flex flex-col gap-2 max-w-[80%]">
+                    {/* Perplexity-style retrieval preview: rendered above
+                        the AI bubble when the backend streamed a
+                        `retrieval_sources` SSE event (after the retrieve
+                        node ran, before any tokens arrive). Lets users see
+                        *what* was searched while the model is still writing
+                        the answer. */}
+                    {message.type === 'ai' &&
+                      message.retrievalSources &&
+                      message.retrievalSources.length > 0 && (
+                        <RetrievalPreview sources={message.retrievalSources} />
+                      )}
                     <div
                       className={`rounded-lg px-4 py-2 ${
                         message.type === 'human'
@@ -198,19 +222,67 @@ export function ChatPanel({
                       }`}
                     >
                       {message.type === 'ai' ? (
-                        <AIMessageContent
-                          content={message.content}
-                          onReferenceClick={handleReferenceClick}
-                        />
+                        <>
+                          {message.content ? (
+                            <AIMessageContent
+                              content={message.content}
+                              onReferenceClick={handleReferenceClick}
+                            />
+                          ) : (
+                            // Streaming AI placeholder before the first token
+                            // arrives — cycle playful status messages through
+                            // <ThinkingIndicator/> so the wait feels animated
+                            // rather than stuck on a bare spinner.
+                            <ThinkingIndicator />
+                          )}
+                          {message.isStreaming && message.content && (
+                            <span
+                              className="ml-0.5 inline-block w-1.5 h-4 align-[-2px] bg-current opacity-70 animate-pulse"
+                              aria-hidden="true"
+                            />
+                          )}
+                        </>
                       ) : (
                         <p className="text-sm break-all">{message.content}</p>
                       )}
                     </div>
                     {message.type === 'ai' && (
-                      <MessageActions
-                        content={message.content}
-                        notebookId={notebookId}
-                      />
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <MessageActions
+                          content={message.content}
+                          notebookId={notebookId}
+                        />
+                        {/* Cached-answer badge + regenerate button. Rendered
+                            only when the backend served this bubble from the
+                            Q&A cache (SSE emitted `cached: true`). Regenerate
+                            re-sends the original question with
+                            bypass_cache=true — the backend runs the LLM
+                            fresh and overwrites the cache row. */}
+                        {message.cached && (
+                          <>
+                            <Badge
+                              variant="secondary"
+                              className="gap-1 h-6 px-2 text-xs"
+                              title={t('chat.cachedTooltip')}
+                            >
+                              <Zap className="h-3 w-3" />
+                              {t('chat.cachedLabel')}
+                            </Badge>
+                            {onRegenerateMessage && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-6 px-2 text-xs gap-1"
+                                onClick={() => onRegenerateMessage(message.id)}
+                                disabled={isStreaming}
+                              >
+                                <RefreshCw className="h-3 w-3" />
+                                {t('chat.regenerate')}
+                              </Button>
+                            )}
+                          </>
+                        )}
+                      </div>
                     )}
                   </div>
                   {message.type === 'human' && (
@@ -223,15 +295,22 @@ export function ChatPanel({
                 </div>
               ))
             )}
-            {isStreaming && (
+            {/* Detached "thinking…" bubble. Shown while isStreaming is true,
+                but suppressed when the last rendered message is already a
+                streaming AI placeholder — in that case the spinner/cursor
+                lives inside the actual AI bubble to avoid a double indicator. */}
+            {isStreaming &&
+              !(messages.length > 0 &&
+                messages[messages.length - 1].type === 'ai' &&
+                messages[messages.length - 1].isStreaming) && (
               <div className="flex gap-3 justify-start">
                 <div className="flex-shrink-0">
-                  <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center">
+                  <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center ring-2 ring-primary/30 animate-pulse motion-reduce:animate-none">
                     <Bot className="h-4 w-4" />
                   </div>
                 </div>
                 <div className="rounded-lg px-4 py-2 bg-muted">
-                  <Loader2 className="h-4 w-4 animate-spin" />
+                  <ThinkingIndicator />
                 </div>
               </div>
             )}
@@ -310,7 +389,10 @@ export function ChatPanel({
               className="h-[40px] w-[40px] flex-shrink-0"
             >
               {isStreaming ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
+                // Compact bouncing dots keep the send button feeling alive
+                // and match the thinking indicator rendered in the message
+                // list (rather than a stock spinner that feels disconnected).
+                <ThinkingIndicator compact />
               ) : (
                 <Send className="h-4 w-4" />
               )}
@@ -321,6 +403,60 @@ export function ChatPanel({
     </Card>
 
     </>
+  )
+}
+
+// Perplexity-style retrieval preview: chip row rendered above each AI
+// bubble that came from a retrieval-backed turn. Sources are sorted by
+// similarity (desc) and clicking a chip opens the source modal.
+function RetrievalPreview({ sources }: { sources: RetrievalSource[] }) {
+  const { t } = useTranslation()
+  const { openModal } = useModalManager()
+
+  // Stable sort: highest similarity first.
+  const ordered = [...sources].sort((a, b) => b.similarity - a.similarity)
+
+  const handleClick = (sourceId: string) => {
+    try {
+      openModal('source', sourceId)
+    } catch {
+      // Modal manager is fire-and-forget; swallow any edge-case throws so a
+      // broken chip click never crashes the whole chat render path.
+    }
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 text-xs">
+      <div className="flex items-center gap-1 text-muted-foreground">
+        <Search className="h-3 w-3" />
+        <span>
+          {t('chat.retrievedSources').replace('{count}', String(ordered.length))}
+        </span>
+      </div>
+      {ordered.map((src) => {
+        // Match mode tooltip helps power users understand *why* a chunk
+        // was retrieved (BM25 text match, vector similarity, or both).
+        const matchBadges = [
+          src.matched_vector ? t('chat.matchVector') : null,
+          src.matched_text ? t('chat.matchText') : null,
+        ].filter(Boolean)
+        const tooltip = `${matchBadges.join(' + ')} · ${(
+          src.similarity * 100
+        ).toFixed(0)}%`
+        return (
+          <button
+            key={src.source_id}
+            type="button"
+            onClick={() => handleClick(src.source_id)}
+            title={tooltip}
+            className="inline-flex items-center gap-1 max-w-[240px] rounded-full border border-border bg-background/60 px-2 py-0.5 hover:bg-muted hover:border-primary/40 transition-colors"
+          >
+            <FileText className="h-3 w-3 flex-shrink-0 text-muted-foreground" />
+            <span className="truncate">{src.title || t('sources.untitledSource')}</span>
+          </button>
+        )
+      })}
+    </div>
   )
 }
 

@@ -469,7 +469,9 @@ function DiscoverModelsDialog({
       .map(m => ({
         name: m.name,
         provider: m.provider,
-        model_type: selectedType,
+        // Use the backend-inferred type when available; fall back to the
+        // user's manual selection (e.g. for custom-typed or bulk-select flows).
+        model_type: m.model_type || selectedType,
       }))
     if (customModelSelected && showCustomOption) {
       selected.push({
@@ -859,6 +861,19 @@ function CredentialItem({
             <AlertTitle className="text-amber-800 dark:text-amber-200">{t('apiKeys.decryptionError')}</AlertTitle>
             <AlertDescription className="text-amber-700 dark:text-amber-300 text-sm">
               {t('apiKeys.decryptionErrorDescription')}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* Auto-disabled credential warning (set when /test detects an auth failure) */}
+        {credential.disabled && !credential.decryption_error && (
+          <Alert className="border-destructive/50 bg-destructive/5">
+            <AlertTriangle className="h-4 w-4 text-destructive" />
+            <AlertTitle className="text-destructive">Credential disabled</AlertTitle>
+            <AlertDescription className="text-destructive/90 text-sm">
+              {credential.last_test_message
+                ? `Connection test failed: ${credential.last_test_message}. Models using this credential are hidden from selection until a test succeeds.`
+                : 'The last connection test failed with an authentication error. Models using this credential are hidden until a test succeeds.'}
             </AlertDescription>
           </Alert>
         )}

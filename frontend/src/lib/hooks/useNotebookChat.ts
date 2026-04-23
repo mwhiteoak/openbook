@@ -12,7 +12,8 @@ import {
   CreateNotebookChatSessionRequest,
   UpdateNotebookChatSessionRequest,
   SourceListResponse,
-  NoteResponse
+  NoteResponse,
+  RetrievalSource
 } from '@/lib/types/api'
 import { ContextSelections } from '@/app/(dashboard)/notebooks/[id]/page'
 
@@ -172,8 +173,20 @@ export function useNotebookChat({ notebookId, sources, notes, contextSelections 
     return response.context
   }, [notebookId, sources, notes, contextSelections])
 
-  // Send message (synchronous, no streaming)
-  const sendMessage = useCallback(async (message: string, modelOverride?: string) => {
+  // Send message with SSE streaming.
+  //
+  // Optimistic UX flow:
+  //   1. Push the user's message immediately (temp- id).
+  //   2. Push an AI placeholder with isStreaming: true so the typing cursor
+  //      appears on an actual bubble instead of a detached spinner.
+  //   3. As `ai_message_delta` events arrive, append deltas to the placeholder.
+  //   4. On `ai_message` (final), replace placeholder content and clear
+  //      isStreaming so the cursor goes away. If the event carries `cached:
+  //      true` we stamp the message with `cached`/`cacheId` so ChatPanel
+  //      renders the "⚡ Cached · Regenerate" badge.
+  //   5. On `complete`, refetch the session so ids/timestamps match the server.
+  //   6. On error, drop the optimistic pair so the user can retry cleanly.
+  const sendMessage = useCallback(async (message: string, modelOverride?: string, options?: { bypassCache?: boolean }) => {
     let sessionId = currentSessionId
 
     // Auto-create session if none exists
@@ -202,37 +215,157 @@ export function useNotebookChat({ notebookId, sources, notes, contextSelections 
       }
     }
 
-    // Add user message optimistically
+    // Add optimistic user message + AI placeholder.
+    const now = Date.now()
+    const userTempId = `temp-user-${now}`
+    const aiTempId = `temp-ai-${now}`
     const userMessage: NotebookChatMessage = {
-      id: `temp-${Date.now()}`,
+      id: userTempId,
       type: 'human',
       content: message,
       timestamp: new Date().toISOString()
     }
-    setMessages(prev => [...prev, userMessage])
+    const aiPlaceholder: NotebookChatMessage = {
+      id: aiTempId,
+      type: 'ai',
+      content: '',
+      timestamp: new Date().toISOString(),
+      isStreaming: true
+    }
+    setMessages(prev => [...prev, userMessage, aiPlaceholder])
     setIsSending(true)
 
+    let accumulated = ''
+    let sawAnyChunk = false
+
     try {
-      // Build context and send message
+      // Build context and open stream
       const context = await buildContext()
-      const response = await chatApi.sendMessage({
+      const body = await chatApi.streamMessage({
         session_id: sessionId,
         message,
         context,
-        model_override: modelOverride ?? (currentSession?.model_override ?? undefined)
+        model_override: modelOverride ?? (currentSession?.model_override ?? undefined),
+        bypass_cache: options?.bypassCache ?? false,
+        notebook_id: notebookId,
       })
 
-      // Update messages with API response
-      setMessages(response.messages)
+      if (!body) {
+        throw new Error('No response body')
+      }
 
-      // Refetch current session to get updated data
+      const reader = body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        // SSE events are terminated by a blank line; split by \n and process
+        // complete `data: ...` lines, keeping any partial trailing chunk.
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim()
+          if (!line.startsWith('data: ')) continue
+
+          let evt: {
+            type: string
+            delta?: string
+            content?: string
+            message?: string
+            id?: string
+            timestamp?: string
+            // Present on ai_message events served from the Q&A cache. We
+            // propagate these onto the message so the UI can render the
+            // "⚡ Cached" badge + Regenerate button.
+            cached?: boolean
+            cache_id?: string
+            // Present on retrieval_sources events emitted right after the
+            // retrieve node finishes (before any answer tokens stream in).
+            sources?: RetrievalSource[]
+          }
+          try {
+            evt = JSON.parse(line.slice(6))
+          } catch (parseErr) {
+            console.error('Error parsing SSE data:', parseErr)
+            continue
+          }
+
+          if (evt.type === 'retrieval_sources' && Array.isArray(evt.sources)) {
+            // Stamp the still-streaming AI placeholder with the sources that
+            // were surfaced by hybrid retrieval. This lets ChatPanel render
+            // "Searching N sources…" chips ABOVE the answer as soon as
+            // retrieval finishes — users see progress before any tokens flow.
+            const sources = evt.sources
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === aiTempId ? { ...m, retrievalSources: sources } : m
+              )
+            )
+          } else if (evt.type === 'ai_message_delta' && typeof evt.delta === 'string') {
+            sawAnyChunk = true
+            accumulated += evt.delta
+            // Functional update so React state updates interleave cleanly
+            // with rapid delta bursts.
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === aiTempId ? { ...m, content: accumulated } : m
+              )
+            )
+          } else if (evt.type === 'ai_message' && typeof evt.content === 'string') {
+            // Final content; reconcile (covers the non-streaming fallback path
+            // on the server where only ai_message is emitted).
+            sawAnyChunk = true
+            accumulated = evt.content
+            const isCached = evt.cached === true
+            const cacheIdVal = evt.cache_id ?? undefined
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === aiTempId
+                  ? {
+                      ...m,
+                      content: accumulated,
+                      isStreaming: false,
+                      // Only set cached fields when present; leaves live
+                      // answers untouched.
+                      ...(isCached ? { cached: true, cacheId: cacheIdVal, prompt: message } : {})
+                    }
+                  : m
+              )
+            )
+          } else if (evt.type === 'error') {
+            throw new Error(evt.message || 'Stream error')
+          } else if (evt.type === 'complete') {
+            // Clear streaming flag in case only deltas arrived and no final
+            // ai_message event was emitted.
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === aiTempId ? { ...m, isStreaming: false } : m
+              )
+            )
+          }
+          // user_message echo is ignored; we already rendered the user bubble.
+        }
+      }
+
+      if (!sawAnyChunk) {
+        // Server finished without producing any AI content — treat as failure
+        // so the user isn't left with a blank bubble.
+        throw new Error('Empty response from chat stream')
+      }
+
+      // Refetch to reconcile temp ids with real db ids/timestamps.
       await refetchCurrentSession()
     } catch (err: unknown) {
       const error = err as { response?: { data?: { detail?: string } }, message?: string };
       console.error('Error sending message:', error)
       toast.error(getApiErrorMessage(error.response?.data?.detail || error.message, (key) => t(key), 'apiErrors.failedToSendMessage'))
-      // Remove optimistic message on error
-      setMessages(prev => prev.filter(msg => !msg.id.startsWith('temp-')))
+      // Remove both optimistic messages on error so the user can retry.
+      setMessages(prev => prev.filter(msg => msg.id !== userTempId && msg.id !== aiTempId))
     } finally {
       setIsSending(false)
     }
@@ -246,6 +379,33 @@ export function useNotebookChat({ notebookId, sources, notes, contextSelections 
     queryClient,
     t
   ])
+
+  // Regenerate a cached answer. The UI calls this when the user clicks the
+  // "Regenerate" button on a cached bubble — we re-send the original question
+  // with bypass_cache so the backend runs the LLM fresh (and then writes the
+  // new answer to the cache, superseding the old one on the next hit).
+  const regenerateMessage = useCallback(
+    async (messageId: string) => {
+      const target = messages.find((m) => m.id === messageId)
+      if (!target || target.type !== 'ai') return
+      // Prefer the prompt we captured at cache-serve time. If we don't have
+      // it (shouldn't happen, but be defensive), fall back to the preceding
+      // human turn in the transcript.
+      let prompt = target.prompt
+      if (!prompt) {
+        const idx = messages.findIndex((m) => m.id === messageId)
+        for (let i = idx - 1; i >= 0; i--) {
+          if (messages[i].type === 'human') {
+            prompt = messages[i].content
+            break
+          }
+        }
+      }
+      if (!prompt) return
+      await sendMessage(prompt, undefined, { bypassCache: true })
+    },
+    [messages, sendMessage]
+  )
 
   // Switch session
   const switchSession = useCallback((sessionId: string) => {
@@ -317,6 +477,7 @@ export function useNotebookChat({ notebookId, sources, notes, contextSelections 
     deleteSession,
     switchSession,
     sendMessage,
+    regenerateMessage,
     setModelOverride,
     refetchSessions
   }

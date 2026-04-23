@@ -224,6 +224,8 @@ def credential_to_response(cred: Credential, model_count: int = 0) -> Credential
         updated=str(cred.updated) if cred.updated else "",
         model_count=model_count,
         decryption_error=cred.decryption_error,
+        disabled=bool(getattr(cred, "disabled", False)),
+        last_test_message=getattr(cred, "last_test_message", None),
     )
 
 
@@ -358,15 +360,63 @@ async def get_env_status() -> Dict[str, bool]:
     return env_status
 
 
+async def _persist_test_result(cred: "Credential", success: bool, message: str) -> None:
+    """Record the outcome of a connection test on the credential itself.
+
+    A hard auth failure disables the credential so the UI can filter it out
+    of selection dropdowns.  A success re-enables it.  Transient failures
+    (network, rate-limit) are recorded but do not disable.
+    """
+    try:
+        msg_lower = message.lower()
+        hard_auth_fail = (
+            not success
+            and (
+                "invalid api key" in msg_lower
+                or "unauthorized" in msg_lower
+                or "permissions" in msg_lower
+                or "forbidden" in msg_lower
+            )
+        )
+
+        if success:
+            cred.disabled = False
+            cred.last_test_message = None
+            await cred.save()
+        elif hard_auth_fail:
+            cred.disabled = True
+            cred.last_test_message = message
+            await cred.save()
+            # Drop any cached provisioned client that was using this credential
+            try:
+                from open_notebook.ai.provision import invalidate_model_cache
+                invalidate_model_cache()
+            except Exception:
+                pass
+        else:
+            # Non-auth failure: record the reason but leave enabled
+            cred.last_test_message = message
+            await cred.save()
+    except Exception as persist_err:
+        logger.debug(f"Could not persist test result for credential: {persist_err}")
+
+
 async def test_credential(credential_id: str) -> dict:
     """
     Test connection using a credential's configuration.
 
-    Returns dict with provider, success, message keys.
+    Returns dict with provider, success, message keys.  Side-effect: auth
+    failures set `credential.disabled = True` so the UI can hide the broken
+    credential from model-selection dropdowns.
     """
     provider = "unknown"
+    cred_obj: Optional["Credential"] = None
+    success = False
+    message = "Unknown error"
+
     try:
         cred = await Credential.get(credential_id)
+        cred_obj = cred
         config = cred.to_esperanto_config()
 
         from open_notebook.ai.connection_tester import (
@@ -381,101 +431,139 @@ async def test_credential(credential_id: str) -> dict:
         if provider == "ollama":
             base_url = config.get("base_url", "http://localhost:11434")
             success, message = await _test_ollama_connection(base_url)
-            return {"provider": provider, "success": success, "message": message}
-
-        if provider == "openai_compatible":
+        elif provider == "openai_compatible":
             base_url = config.get("base_url")
             api_key = config.get("api_key")
             if not base_url:
-                return {
-                    "provider": provider,
-                    "success": False,
-                    "message": "No base URL configured",
-                }
-            success, message = await _test_openai_compatible_connection(
-                base_url, api_key
-            )
-            return {"provider": provider, "success": success, "message": message}
-
-        if provider == "azure":
+                success, message = False, "No base URL configured"
+            else:
+                success, message = await _test_openai_compatible_connection(
+                    base_url, api_key
+                )
+        elif provider == "azure":
             success, message = await _test_azure_connection(
                 endpoint=config.get("endpoint"),
                 api_key=config.get("api_key"),
                 api_version=config.get("api_version"),
             )
-            return {"provider": provider, "success": success, "message": message}
+        else:
+            # Standard provider: use Esperanto to create and test
+            from esperanto.factory import AIFactory
 
-        # Standard provider: use Esperanto to create and test
-        from esperanto.factory import AIFactory
+            from open_notebook.ai.connection_tester import TEST_MODELS
 
-        from open_notebook.ai.connection_tester import TEST_MODELS
-
-        if provider not in TEST_MODELS:
-            return {
-                "provider": provider,
-                "success": False,
-                "message": f"Unknown provider: {provider}",
-            }
-
-        test_model, test_type = TEST_MODELS[provider]
-        if not test_model:
-            return {
-                "provider": provider,
-                "success": False,
-                "message": f"No test model configured for {provider}",
-            }
-
-        if test_type == "language":
-            model = AIFactory.create_language(
-                model_name=test_model, provider=provider, config=config
-            )
-            lc_model = model.to_langchain()
-            await lc_model.ainvoke("Hi")
-            return {"provider": provider, "success": True, "message": "Connection successful"}
-
-        elif test_type == "embedding":
-            model = AIFactory.create_embedding(
-                model_name=test_model, provider=provider, config=config
-            )
-            await model.aembed(["test"])
-            return {"provider": provider, "success": True, "message": "Connection successful"}
-
-        elif test_type == "text_to_speech":
-            AIFactory.create_text_to_speech(model_name=test_model, provider=provider, config=config)
-            return {
-                "provider": provider,
-                "success": True,
-                "message": "Connection successful (key format valid)",
-            }
-
-        return {
-            "provider": provider,
-            "success": False,
-            "message": f"Unsupported test type: {test_type}",
-        }
+            if provider not in TEST_MODELS:
+                success, message = False, f"Unknown provider: {provider}"
+            else:
+                test_model, test_type = TEST_MODELS[provider]
+                if not test_model:
+                    success, message = False, f"No test model configured for {provider}"
+                elif test_type == "language":
+                    model = AIFactory.create_language(
+                        model_name=test_model, provider=provider, config=config
+                    )
+                    lc_model = model.to_langchain()
+                    await lc_model.ainvoke("Hi")
+                    success, message = True, "Connection successful"
+                elif test_type == "embedding":
+                    model = AIFactory.create_embedding(
+                        model_name=test_model, provider=provider, config=config
+                    )
+                    await model.aembed(["test"])
+                    success, message = True, "Connection successful"
+                elif test_type == "text_to_speech":
+                    AIFactory.create_text_to_speech(
+                        model_name=test_model, provider=provider, config=config
+                    )
+                    success, message = True, "Connection successful (key format valid)"
+                else:
+                    success, message = False, f"Unsupported test type: {test_type}"
 
     except Exception as e:
         error_msg = str(e)
         if "401" in error_msg or "unauthorized" in error_msg.lower():
-            return {"provider": provider, "success": False, "message": "Invalid API key"}
+            success, message = False, "Invalid API key"
         elif "403" in error_msg or "forbidden" in error_msg.lower():
-            return {"provider": provider, "success": False, "message": "API key lacks required permissions"}
+            success, message = False, "API key lacks required permissions"
         elif "rate" in error_msg.lower() and "limit" in error_msg.lower():
-            return {"provider": provider, "success": True, "message": "Rate limited - but connection works"}
+            success, message = True, "Rate limited - but connection works"
         elif "not found" in error_msg.lower() and "model" in error_msg.lower():
-            return {"provider": provider, "success": True, "message": "API key valid (test model not available)"}
+            success, message = True, "API key valid (test model not available)"
         else:
             logger.debug(f"Test connection error for credential {credential_id}: {e}")
             truncated = error_msg[:100] + "..." if len(error_msg) > 100 else error_msg
-            return {"provider": provider, "success": False, "message": f"Error: {truncated}"}
+            success, message = False, f"Error: {truncated}"
+
+    # Persist the outcome (auto-disable on auth failure, re-enable on success)
+    if cred_obj is not None:
+        await _persist_test_result(cred_obj, success, message)
+
+    return {"provider": provider, "success": success, "message": message}
+
+
+def infer_model_type(name: str, provider: str) -> str:
+    """
+    Infer the model type from its name and provider.
+
+    Returns one of: 'language', 'embedding', 'text_to_speech', 'speech_to_text'.
+    Defaults to 'language' when the name doesn't match any known pattern.
+    """
+    n = name.lower()
+
+    # Voyage is an embedding-only provider
+    if provider == "voyage":
+        return "embedding"
+
+    # ElevenLabs is a TTS-only provider
+    if provider == "elevenlabs":
+        return "text_to_speech"
+
+    # Embedding patterns (checked before language to avoid mis-classifying)
+    EMBEDDING_PATTERNS = [
+        "text-embedding",   # OpenAI text-embedding-3-*, text-embedding-ada-002
+        "embed",            # Mistral embed, Cohere embed, etc.
+        "-ada-002",         # legacy OpenAI
+        "nomic-embed",
+        "mxbai-embed",
+        "snowflake-arctic-embed",
+        "bge-",             # BAAI BGE embedding models on Ollama
+        "all-minilm",
+    ]
+    if any(p in n for p in EMBEDDING_PATTERNS):
+        return "embedding"
+
+    # TTS patterns
+    TTS_PATTERNS = [
+        "tts-",
+        "text-to-speech",
+        "eleven_",          # ElevenLabs model IDs
+        "eleven-",
+        "gpt-4o-mini-tts",
+        "gpt-4o-audio",
+    ]
+    if any(p in n for p in TTS_PATTERNS):
+        return "text_to_speech"
+
+    # STT patterns
+    STT_PATTERNS = [
+        "whisper",
+        "speech-to-text",
+        "transcribe",
+        "gpt-4o-transcribe",
+        "gpt-4o-mini-transcribe",
+    ]
+    if any(p in n for p in STT_PATTERNS):
+        return "speech_to_text"
+
+    return "language"
 
 
 async def discover_with_config(provider: str, config: dict) -> List[dict]:
     """
     Discover models using explicit config instead of env vars.
 
-    Returns model names only — no type classification.
-    The user chooses the model type when registering.
+    Returns models with inferred type hints.  The user can override the type
+    in the UI before registering, but sensible defaults are pre-filled.
     """
     api_key = config.get("api_key")
     base_url = config.get("base_url")
@@ -505,7 +593,7 @@ async def discover_with_config(provider: str, config: dict) -> List[dict]:
         if not api_key and provider != "ollama":
             return []
         return [
-            {"name": m, "provider": provider}
+            {"name": m, "provider": provider, "model_type": infer_model_type(m, provider)}
             for m in STATIC_MODELS[provider]
         ]
 
@@ -529,7 +617,11 @@ async def discover_with_config(provider: str, config: dict) -> List[dict]:
                 response.raise_for_status()
                 data = response.json()
                 return [
-                    {"name": m.get("name", ""), "provider": "ollama"}
+                    {
+                        "name": m.get("name", ""),
+                        "provider": "ollama",
+                        "model_type": infer_model_type(m.get("name", ""), "ollama"),
+                    }
                     for m in data.get("models", [])
                     if m.get("name")
                 ]
@@ -551,7 +643,11 @@ async def discover_with_config(provider: str, config: dict) -> List[dict]:
                 response.raise_for_status()
                 data = response.json()
                 return [
-                    {"name": m.get("id", ""), "provider": "openai_compatible"}
+                    {
+                        "name": m.get("id", ""),
+                        "provider": "openai_compatible",
+                        "model_type": infer_model_type(m.get("id", ""), "openai_compatible"),
+                    }
                     for m in data.get("data", [])
                     if m.get("id")
                 ]
@@ -572,7 +668,11 @@ async def discover_with_config(provider: str, config: dict) -> List[dict]:
                 response.raise_for_status()
                 data = response.json()
                 return [
-                    {"name": m.get("id", ""), "provider": "azure"}
+                    {
+                        "name": m.get("id", ""),
+                        "provider": "azure",
+                        "model_type": infer_model_type(m.get("id", ""), "azure"),
+                    }
                     for m in data.get("data", [])
                     if m.get("id")
                 ]
@@ -590,7 +690,10 @@ async def discover_with_config(provider: str, config: dict) -> List[dict]:
             "gemini-1.5-flash",
             "text-embedding-005",
         ]
-        return [{"name": m, "provider": "vertex"} for m in VERTEX_MODELS]
+        return [
+            {"name": m, "provider": "vertex", "model_type": infer_model_type(m, "vertex")}
+            for m in VERTEX_MODELS
+        ]
 
     if provider == "google":
         try:
@@ -608,6 +711,9 @@ async def discover_with_config(provider: str, config: dict) -> List[dict]:
                         "name": model.get("name", "").replace("models/", ""),
                         "provider": "google",
                         "description": model.get("displayName"),
+                        "model_type": infer_model_type(
+                            model.get("name", "").replace("models/", ""), "google"
+                        ),
                     }
                     for model in data.get("models", [])
                     if model.get("name")
@@ -636,6 +742,7 @@ async def discover_with_config(provider: str, config: dict) -> List[dict]:
                     "name": m.get("id", ""),
                     "provider": provider,
                     "description": m.get("name"),
+                    "model_type": infer_model_type(m.get("id", ""), provider),
                 }
                 for m in data.get("data", [])
                 if m.get("id")

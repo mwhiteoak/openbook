@@ -11,7 +11,8 @@ import {
   SourceChatMessage,
   SourceChatContextIndicator,
   CreateSourceChatSessionRequest,
-  UpdateSourceChatSessionRequest
+  UpdateSourceChatSessionRequest,
+  RetrievalSource
 } from '@/lib/types/api'
 
 export function useSourceChat(sourceId: string) {
@@ -101,8 +102,23 @@ export function useSourceChat(sourceId: string) {
     }
   })
 
-  // Send message with streaming
-  const sendMessage = useCallback(async (message: string, modelOverride?: string) => {
+  // Send message with streaming.
+  //
+  // Same optimistic flow as notebook chat:
+  //   1. Push user's message + AI placeholder (isStreaming: true) upfront.
+  //   2. Accumulate `ai_message_delta` chunks onto the placeholder.
+  //   3. On `ai_message` (final), replace placeholder content; stamp
+  //      `cached`/`cacheId`/`prompt` when the event came from the Q&A cache
+  //      so ChatPanel can render the "⚡ Cached · Regenerate" badge.
+  //   4. Clear isStreaming on `complete` (or on final ai_message).
+  //
+  // The `options.bypassCache` flag is set by the Regenerate button; backend
+  // skips cache lookup but still writes through so the fresh answer wins.
+  const sendMessage = useCallback(async (
+    message: string,
+    modelOverride?: string,
+    options?: { bypassCache?: boolean }
+  ) => {
     let sessionId = currentSessionId
 
     // Auto-create session if none exists
@@ -121,20 +137,34 @@ export function useSourceChat(sourceId: string) {
       }
     }
 
-    // Add user message optimistically
+    // Optimistic user message + AI placeholder with streaming cursor
+    const now = Date.now()
+    const userTempId = `temp-user-${now}`
+    const aiTempId = `temp-ai-${now}`
     const userMessage: SourceChatMessage = {
-      id: `temp-${Date.now()}`,
+      id: userTempId,
       type: 'human',
       content: message,
       timestamp: new Date().toISOString()
     }
-    setMessages(prev => [...prev, userMessage])
+    const aiPlaceholder: SourceChatMessage = {
+      id: aiTempId,
+      type: 'ai',
+      content: '',
+      timestamp: new Date().toISOString(),
+      isStreaming: true
+    }
+    setMessages(prev => [...prev, userMessage, aiPlaceholder])
     setIsStreaming(true)
+
+    let accumulated = ''
+    let sawAnyChunk = false
 
     try {
       const response = await sourceChatApi.sendMessage(sourceId, sessionId, {
         message,
-        model_override: modelOverride
+        model_override: modelOverride,
+        bypass_cache: options?.bypassCache ?? false
       })
 
       if (!response) {
@@ -143,66 +173,122 @@ export function useSourceChat(sourceId: string) {
 
       const reader = response.getReader()
       const decoder = new TextDecoder()
-      let aiMessage: SourceChatMessage | null = null
+      let buffer = ''
 
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
 
-        const text = decoder.decode(value)
-        const lines = text.split('\n')
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        // Keep the trailing partial chunk in buffer.
+        buffer = lines.pop() ?? ''
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6))
-              
-              if (data.type === 'ai_message') {
-                // Create AI message on first content chunk to avoid empty bubble
-                if (!aiMessage) {
-                  aiMessage = {
-                    id: `ai-${Date.now()}`,
-                    type: 'ai',
-                    content: data.content || '',
-                    timestamp: new Date().toISOString()
-                  }
-                  setMessages(prev => [...prev, aiMessage!])
-                } else {
-                  aiMessage.content += data.content || ''
-                  setMessages(prev =>
-                    prev.map(msg => msg.id === aiMessage!.id
-                      ? { ...msg, content: aiMessage!.content }
-                      : msg
-                    )
-                  )
-                }
-              } else if (data.type === 'context_indicators') {
-                setContextIndicators(data.data)
-              } else if (data.type === 'error') {
-                throw new Error(data.message || 'Stream error')
-              }
-            } catch (e) {
-              if (e instanceof SyntaxError) {
-                console.error('Error parsing SSE data:', e)
-              } else {
-                throw e
-              }
-            }
+        for (const rawLine of lines) {
+          const line = rawLine.trim()
+          if (!line.startsWith('data: ')) continue
+
+          let data: {
+            type: string
+            delta?: string
+            content?: string
+            message?: string
+            id?: string
+            data?: unknown
+            cached?: boolean
+            cache_id?: string
+            // Retrieval preview payload — present on `retrieval_sources`
+            // events emitted after the retrieve node runs.
+            sources?: RetrievalSource[]
+          }
+          try {
+            data = JSON.parse(line.slice(6))
+          } catch (parseErr) {
+            console.error('Error parsing SSE data:', parseErr)
+            continue
+          }
+
+          if (data.type === 'retrieval_sources' && Array.isArray(data.sources)) {
+            // Stamp the AI placeholder with the retrieval preview so the
+            // UI can render source chips above the bubble before the first
+            // answer token arrives. Shared semantics with useNotebookChat.
+            const retrieval = data.sources
+            setMessages(prev =>
+              prev.map(m => m.id === aiTempId ? { ...m, retrievalSources: retrieval } : m)
+            )
+          } else if (data.type === 'ai_message_delta' && typeof data.delta === 'string') {
+            sawAnyChunk = true
+            accumulated += data.delta
+            setMessages(prev =>
+              prev.map(m => m.id === aiTempId ? { ...m, content: accumulated } : m)
+            )
+          } else if (data.type === 'ai_message' && typeof data.content === 'string') {
+            // Final content (or non-streaming fallback); reconcile.
+            sawAnyChunk = true
+            accumulated = data.content
+            const isCached = data.cached === true
+            const cacheIdVal = data.cache_id ?? undefined
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === aiTempId
+                  ? {
+                      ...m,
+                      content: accumulated,
+                      isStreaming: false,
+                      ...(isCached ? { cached: true, cacheId: cacheIdVal } : {})
+                    }
+                  : m
+              )
+            )
+          } else if (data.type === 'context_indicators') {
+            setContextIndicators(data.data as SourceChatContextIndicator)
+          } else if (data.type === 'complete') {
+            // Clear streaming flag in case only deltas arrived.
+            setMessages(prev =>
+              prev.map(m => m.id === aiTempId ? { ...m, isStreaming: false } : m)
+            )
+          } else if (data.type === 'error') {
+            throw new Error(data.message || 'Stream error')
           }
         }
+      }
+
+      if (!sawAnyChunk) {
+        throw new Error('Empty response from chat stream')
       }
     } catch (err: unknown) {
       const error = err as { response?: { data?: { detail?: string } }, message?: string };
       console.error('Error sending message:', error)
       toast.error(getApiErrorMessage(error.response?.data?.detail || error.message, (key) => t(key), 'apiErrors.failedToSendMessage'))
-      // Remove optimistic messages on error
-      setMessages(prev => prev.filter(msg => !msg.id.startsWith('temp-')))
+      // Remove optimistic pair on error
+      setMessages(prev => prev.filter(msg => msg.id !== userTempId && msg.id !== aiTempId))
     } finally {
       setIsStreaming(false)
       // Refetch session to get persisted messages
       refetchCurrentSession()
     }
   }, [sourceId, currentSessionId, refetchCurrentSession, queryClient, t])
+
+  // Regenerate a cached answer. Finds the question that produced the cached
+  // bubble (preferring the captured prompt, falling back to the preceding
+  // human turn) and re-sends it with bypass_cache=true.
+  const regenerateMessage = useCallback(
+    async (messageId: string) => {
+      const target = messages.find(m => m.id === messageId)
+      if (!target || target.type !== 'ai') return
+      const idx = messages.findIndex(m => m.id === messageId)
+      let prompt: string | undefined
+      for (let i = idx - 1; i >= 0; i--) {
+        if (messages[i].type === 'human') {
+          prompt = messages[i].content
+          break
+        }
+      }
+      if (!prompt) return
+      await sendMessage(prompt, undefined, { bypassCache: true })
+    },
+    [messages, sendMessage]
+  )
 
   // Cancel streaming
   const cancelStreaming = useCallback(() => {
@@ -249,6 +335,7 @@ export function useSourceChat(sourceId: string) {
     deleteSession,
     switchSession,
     sendMessage,
+    regenerateMessage,
     cancelStreaming,
     refetchSessions
   }

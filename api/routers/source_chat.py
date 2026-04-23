@@ -1,20 +1,26 @@
 import asyncio
 import json
-from typing import AsyncGenerator, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Path
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from loguru import logger
 from pydantic import BaseModel, Field
 
 from open_notebook.database.repository import ensure_record_id, repo_query
+from open_notebook.domain.chat_cache import (
+    bump_cache_hit,
+    find_cached_answer,
+    save_cached_answer,
+)
 from open_notebook.domain.notebook import ChatSession, Source
 from open_notebook.exceptions import (
     NotFoundError,
 )
-from open_notebook.graphs.source_chat import source_chat_graph as source_chat_graph
+from open_notebook.graphs.source_chat import get_source_chat_graph
+from open_notebook.utils.cache_fingerprint import compute_context_fingerprint
 from open_notebook.utils.graph_utils import get_session_message_count
 
 router = APIRouter()
@@ -77,6 +83,11 @@ class SendMessageRequest(BaseModel):
     message: str = Field(..., description="User message content")
     model_override: Optional[str] = Field(
         None, description="Optional model override for this message"
+    )
+    # Set by the UI's "Regenerate" button on a cached answer. We still write
+    # the fresh answer to the cache, so the old entry is naturally superseded.
+    bypass_cache: bool = Field(
+        False, description="Skip Q&A cache lookup for this request"
     )
 
 class SuccessResponse(BaseModel):
@@ -150,6 +161,7 @@ async def get_source_chat_sessions(source_id: str = Path(..., description="Sourc
         )
 
         sessions = []
+        source_chat_graph = await get_source_chat_graph()
         for relation in relations:
             session_id_raw = relation.get("in")
             if session_id_raw:
@@ -233,9 +245,8 @@ async def get_source_chat_session(
             )
 
         # Get session state from LangGraph to retrieve messages
-        # Use sync get_state() in a thread since SqliteSaver doesn't support async
-        thread_state = await asyncio.to_thread(
-            source_chat_graph.get_state,
+        source_chat_graph = await get_source_chat_graph()
+        thread_state = await source_chat_graph.aget_state(
             config=RunnableConfig(configurable={"thread_id": full_session_id}),
         )
 
@@ -339,6 +350,7 @@ async def update_source_chat_session(
         await session.save()
 
         # Get message count from LangGraph state
+        source_chat_graph = await get_source_chat_graph()
         msg_count = await get_session_message_count(source_chat_graph, full_session_id)
 
         return SourceChatSessionResponse(
@@ -414,70 +426,268 @@ async def delete_source_chat_session(
         )
 
 
-async def stream_source_chat_response(
-    session_id: str, source_id: str, message: str, model_override: Optional[str] = None
-) -> AsyncGenerator[str, None]:
-    """Stream the source chat response as Server-Sent Events."""
+async def _compute_source_chat_fingerprint(
+    *,
+    source_id: str,
+    model_override: Optional[str],
+) -> Optional[str]:
+    """Fingerprint for source-chat cache entries.
+
+    Source chats don't take a user-configurable context — the graph builds
+    context internally from the source's insights + content. So the only
+    moving parts are the source's ``updated`` timestamp (flips when content
+    is re-ingested) and the selected model.
+    """
+    timestamps: List[Any] = []
     try:
-        # Get current state
-        # Use sync get_state() in a thread since SqliteSaver doesn't support async
-        current_state = await asyncio.to_thread(
-            source_chat_graph.get_state,
+        rows = await repo_query(
+            "SELECT updated FROM $id",
+            {"id": ensure_record_id(source_id)},
+        )
+        if rows and rows[0].get("updated"):
+            timestamps.append(rows[0]["updated"])
+    except Exception:
+        return None
+
+    return compute_context_fingerprint(
+        notebook_id=None,
+        source_id=source_id,
+        context_config=None,
+        model_id=model_override,
+        source_updated_timestamps=timestamps,
+    )
+
+
+async def _stream_cached_source_chat_answer(
+    *,
+    session_id: str,
+    message: str,
+    cache_row: Dict[str, Any],
+) -> AsyncGenerator[str, None]:
+    """Replay a cached answer over SSE + persist the turn to the checkpoint.
+
+    Source chat has the same emission contract as notebook chat but with an
+    extra `context_indicators` event — we intentionally skip emitting one
+    here because the cached answer wasn't produced by the graph and we
+    don't have a fresh context-indicators dict. The UI renders a "cached"
+    badge instead, which is enough signal for the user.
+    """
+    answer_text = str(cache_row.get("answer") or "")
+    cache_id = str(cache_row.get("id") or "")
+
+    yield f"data: {json.dumps({'type': 'user_message', 'content': message, 'timestamp': None})}\n\n"
+
+    ai_id = f"cached_{cache_id}" if cache_id else "cached"
+    yield f"data: {json.dumps({'type': 'ai_message', 'id': ai_id, 'content': answer_text, 'timestamp': None, 'cached': True, 'cache_id': cache_id})}\n\n"
+
+    # Persist user + AI turn into the source chat checkpoint so the
+    # conversation history matches the live case. Failures here don't
+    # affect the already-streamed response.
+    try:
+        source_chat_graph = await get_source_chat_graph()
+        await source_chat_graph.aupdate_state(
+            config=RunnableConfig(configurable={"thread_id": session_id}),
+            values={
+                "messages": [
+                    HumanMessage(content=message),
+                    AIMessage(content=answer_text, id=ai_id),
+                ]
+            },
+            as_node="agent",
+        )
+    except Exception as e:
+        logger.warning(f"Failed to persist cached source-chat turn: {e}")
+
+    if cache_id:
+        await bump_cache_hit(cache_id)
+
+    yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+
+
+async def stream_source_chat_response(
+    session_id: str,
+    source_id: str,
+    message: str,
+    model_override: Optional[str] = None,
+    *,
+    bypass_cache: bool = False,
+) -> AsyncGenerator[str, None]:
+    """Stream the source chat response as Server-Sent Events.
+
+    Uses LangGraph's `astream_events` to emit token-level deltas. Falls back
+    to `ainvoke` if the provider doesn't support streaming. Consults the
+    Q&A cache before invoking the graph to skip LLM calls for repeat
+    questions within the same source + model scope.
+    """
+    # ---- Cache lookup (source scope) ------------------------------------
+    cache_fingerprint = await _compute_source_chat_fingerprint(
+        source_id=source_id,
+        model_override=model_override,
+    )
+
+    if cache_fingerprint and not bypass_cache:
+        try:
+            cache_hit = await find_cached_answer(
+                question=message,
+                context_fingerprint=cache_fingerprint,
+                source_id=source_id,
+                model_id=model_override,
+            )
+        except Exception as e:
+            logger.warning(f"Source-chat cache lookup raised: {e}")
+            cache_hit = None
+
+        if cache_hit:
+            async for chunk in _stream_cached_source_chat_answer(
+                session_id=session_id,
+                message=message,
+                cache_row=cache_hit,
+            ):
+                yield chunk
+            return
+
+    try:
+        source_chat_graph = await get_source_chat_graph()
+        # Get current checkpoint state via AsyncSqliteSaver
+        current_state = await source_chat_graph.aget_state(
             config=RunnableConfig(configurable={"thread_id": session_id}),
         )
 
-        # Prepare state for execution
         state_values = current_state.values if current_state else {}
         state_values["messages"] = state_values.get("messages", [])
         state_values["source_id"] = source_id
         state_values["model_override"] = model_override
 
-        # Add user message to state
         user_message = HumanMessage(content=message)
         state_values["messages"].append(user_message)
 
-        # Send user message event
-        user_event = {"type": "user_message", "content": message, "timestamp": None}
-        yield f"data: {json.dumps(user_event)}\n\n"
+        # Echo user message
+        yield f"data: {json.dumps({'type': 'user_message', 'content': message, 'timestamp': None})}\n\n"
 
-        # Execute source chat graph synchronously (like notebook chat does)
-        result = source_chat_graph.invoke(
-            input=state_values,  # type: ignore[arg-type]
-            config=RunnableConfig(
-                configurable={"thread_id": session_id, "model_id": model_override}
-            ),
+        accumulated = ""
+        ai_message_id: Optional[str] = None
+        saw_chunk = False
+        final_state: dict = {}
+
+        config = RunnableConfig(
+            configurable={"thread_id": session_id, "model_id": model_override}
         )
 
-        # Stream the complete AI response
-        if "messages" in result:
-            for msg in result["messages"]:
-                if hasattr(msg, "type") and msg.type == "ai":
-                    ai_event = {
-                        "type": "ai_message",
-                        "content": msg.content if hasattr(msg, "content") else str(msg),
-                        "timestamp": None,
-                    }
-                    yield f"data: {json.dumps(ai_event)}\n\n"
+        try:
+            async for event in source_chat_graph.astream_events(
+                input=state_values,  # type: ignore[arg-type]
+                config=config,
+                version="v2",
+            ):
+                ev_type = event.get("event")
 
-        # Stream context indicators
-        if "context_indicators" in result:
-            context_event = {
-                "type": "context_indicators",
-                "data": result["context_indicators"],
-            }
-            yield f"data: {json.dumps(context_event)}\n\n"
+                if ev_type == "on_chat_model_stream":
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk is None:
+                        continue
+                    delta = getattr(chunk, "content", None)
+                    if isinstance(delta, list):
+                        delta = "".join(
+                            p.get("text", "") if isinstance(p, dict) else str(p)
+                            for p in delta
+                        )
+                    if not delta:
+                        continue
+                    saw_chunk = True
+                    accumulated += delta
+                    if ai_message_id is None:
+                        ai_message_id = getattr(chunk, "id", None) or "ai_stream"
+                    yield f"data: {json.dumps({'type': 'ai_message_delta', 'id': ai_message_id, 'delta': delta})}\n\n"
+                elif ev_type == "on_chain_end":
+                    # Capture node-return state so we can emit context_indicators
+                    data = event.get("data", {}) or {}
+                    output = data.get("output")
+                    if isinstance(output, dict) and "context_indicators" in output:
+                        final_state = output
+        except Exception as e:
+            # Do NOT reset `saw_chunk` / `accumulated` here. If the stream
+            # produced content before failing, LangGraph has already
+            # checkpointed the AI message. Falling back to `ainvoke` would
+            # run the LLM a second time and persist a duplicate AI message,
+            # which the frontend's refetch then renders as two bubbles.
+            logger.warning(
+                f"Source chat stream interrupted after {len(accumulated)} "
+                f"chars (saw_chunk={saw_chunk}): {e}"
+            )
 
-        # Send completion signal
-        completion_event = {"type": "complete"}
-        yield f"data: {json.dumps(completion_event)}\n\n"
+        final_answer_text: str = ""
+
+        if not saw_chunk:
+            # Fallback only when the stream produced nothing at all. Some
+            # providers (esp. Ollama via certain proxies) don't emit
+            # on_chat_model_stream events, so we still need a one-shot
+            # ainvoke path. We emit only the NEWEST AI message — iterating
+            # every AI message in the session history would echo past turns.
+            result = await source_chat_graph.ainvoke(
+                input=state_values,  # type: ignore[arg-type]
+                config=config,
+            )
+            final_state = result or {}
+            ai_msgs = [
+                m
+                for m in (result.get("messages") or [])
+                if hasattr(m, "type") and m.type == "ai"
+            ]
+            if ai_msgs:
+                latest = ai_msgs[-1]
+                content = latest.content if hasattr(latest, "content") else str(latest)
+                final_answer_text = str(content)
+                yield f"data: {json.dumps({'type': 'ai_message', 'id': getattr(latest, 'id', 'ai_msg'), 'content': content, 'timestamp': None})}\n\n"
+        else:
+            final_answer_text = accumulated
+            yield f"data: {json.dumps({'type': 'ai_message', 'id': ai_message_id or 'ai_stream', 'content': accumulated, 'timestamp': None})}\n\n"
+
+        # Emit context indicators (sources/insights/notes referenced)
+        context_indicators = final_state.get("context_indicators") if final_state else None
+        if context_indicators is None:
+            # Fall back to checkpoint state
+            try:
+                latest = await source_chat_graph.aget_state(
+                    config=RunnableConfig(configurable={"thread_id": session_id}),
+                )
+                if latest and latest.values:
+                    context_indicators = latest.values.get("context_indicators")
+            except Exception:
+                context_indicators = None
+
+        if context_indicators:
+            yield f"data: {json.dumps({'type': 'context_indicators', 'data': context_indicators})}\n\n"
+
+        # Write-through to Q&A cache. TRULY fire-and-forget: schedule it and
+        # move on so the `complete` SSE event flushes immediately. The helper
+        # generates an embedding for the question internally (another LLM
+        # round-trip), which we don't want on the user-visible response path.
+        if cache_fingerprint and final_answer_text.strip():
+            try:
+                asyncio.create_task(
+                    save_cached_answer(
+                        question=message,
+                        answer=final_answer_text,
+                        context_fingerprint=cache_fingerprint,
+                        source_id=source_id,
+                        model_id=model_override,
+                    )
+                )
+            except Exception as e:
+                logger.debug(f"Source-chat cache write scheduling failed (non-fatal): {e}")
+
+        # Completion
+        yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
     except Exception as e:
         from open_notebook.utils.error_classifier import classify_error
 
-        _, user_message = classify_error(e)
+        try:
+            _, user_message = classify_error(e)
+        except Exception:
+            user_message = str(e)
         logger.error(f"Error in source chat streaming: {str(e)}")
-        error_event = {"type": "error", "message": user_message}
-        yield f"data: {json.dumps(error_event)}\n\n"
+        yield f"data: {json.dumps({'type': 'error', 'message': user_message})}\n\n"
 
 
 @router.post("/sources/{source_id}/chat/sessions/{session_id}/messages")
@@ -538,12 +748,14 @@ async def send_message_to_source_chat(
                 source_id=full_source_id,
                 message=request.message,
                 model_override=model_override,
+                bypass_cache=request.bypass_cache,
             ),
-            media_type="text/plain",
+            media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                "Content-Type": "text/plain; charset=utf-8",
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "X-Accel-Buffering": "no",
             },
         )
 

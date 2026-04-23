@@ -149,6 +149,21 @@ export interface SourceChatMessage {
   type: 'human' | 'ai'
   content: string
   timestamp?: string
+  // True while SSE deltas are still arriving (shared semantics with
+  // NotebookChatMessage). ChatPanel uses this to drive a streaming cursor
+  // and to suppress the standalone "thinking…" bubble.
+  isStreaming?: boolean
+  // Set when the answer came from the Q&A cache rather than a fresh LLM
+  // call. The UI renders a "⚡ Cached · Regenerate" badge on these bubbles.
+  cached?: boolean
+  // Cache row id — used by the Regenerate button (which sends the same
+  // question with bypass_cache=true, causing a fresh answer to overwrite
+  // the old one on the next lookup).
+  cacheId?: string
+  // Perplexity-style retrieval preview. Populated by the `retrieval_sources`
+  // SSE event emitted after the retrieve node runs but before the answer
+  // streams in. Present on notebook chat and (once wired) source chat.
+  retrievalSources?: RetrievalSource[]
 }
 
 export interface SourceChatContextIndicator {
@@ -176,14 +191,28 @@ export interface UpdateSourceChatSessionRequest {
 export interface SendMessageRequest {
   message: string
   model_override?: string
+  // True when the user clicked "Regenerate" on a cached answer. Backend
+  // skips cache lookup but still writes through so the new answer supersedes.
+  bypass_cache?: boolean
 }
 
 export interface SourceChatStreamEvent {
-  type: 'user_message' | 'ai_message' | 'context_indicators' | 'complete' | 'error'
+  type:
+    | 'user_message'
+    | 'ai_message'
+    | 'ai_message_delta'
+    | 'context_indicators'
+    | 'complete'
+    | 'error'
+  id?: string
+  delta?: string
   content?: string
   data?: unknown
   message?: string
   timestamp?: string
+  // Present on ai_message events served from the Q&A cache.
+  cached?: boolean
+  cache_id?: string
 }
 
 // Notebook Chat Types
@@ -196,6 +225,38 @@ export interface NotebookChatMessage {
   type: 'human' | 'ai'
   content: string
   timestamp?: string
+  // Set to true while SSE deltas are still arriving for this message.
+  // The UI renders a typing cursor on streaming bubbles and suppresses the
+  // standalone "AI is thinking…" spinner when a streaming AI message exists.
+  isStreaming?: boolean
+  // Set when this answer was served from the Q&A cache. Drives the
+  // "⚡ Cached · Regenerate" badge in ChatPanel.
+  cached?: boolean
+  // Server-side cache row id; needed so the Regenerate button can link the
+  // new LLM answer back to the stored row (the backend overwrites by
+  // fingerprint+question, so we just re-send with bypass_cache).
+  cacheId?: string
+  // Original question that produced this answer. We need it for the
+  // Regenerate click because the AI bubble itself doesn't carry the prompt.
+  prompt?: string
+  // Perplexity-style retrieval preview: light-weight descriptor of the
+  // source excerpts that fed the LLM for this turn. Populated by the
+  // `retrieval_sources` SSE event, which fires AFTER the retrieve node
+  // runs but BEFORE any answer tokens stream in. The UI renders these as
+  // chips above the answer so users see what was searched before the
+  // answer is even written.
+  retrievalSources?: RetrievalSource[]
+}
+
+// Descriptor of a source chunk surfaced by hybrid retrieval. Emitted in the
+// `retrieval_sources` SSE event — see open_notebook/graphs/chat.py and
+// api/routers/chat.py for producer details.
+export interface RetrievalSource {
+  source_id: string
+  title: string
+  similarity: number
+  matched_vector: boolean
+  matched_text: boolean
 }
 
 export interface NotebookChatSessionWithMessages extends NotebookChatSession {
@@ -221,6 +282,13 @@ export interface SendNotebookChatMessageRequest {
     notes: Array<Record<string, unknown>>
   }
   model_override?: string
+  // True when the user clicked Regenerate on a cached answer — the backend
+  // skips the cache lookup but still writes the fresh answer, which
+  // supersedes the cached row on the next hit.
+  bypass_cache?: boolean
+  // Scope for the Q&A cache lookup. Passing this saves the API a refers_to
+  // round-trip; older clients without it fall back to the session edge.
+  notebook_id?: string
 }
 
 export interface BuildContextRequest {

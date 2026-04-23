@@ -296,6 +296,12 @@ export const enUS = {
     statusProcessingDesc: "Being processed",
     statusCompletedDesc: "Successfully processed",
     statusFailedDesc: "Processing failed",
+    stageQueued: "Queued",
+    stageExtracting: "Extracting content",
+    stageEmbedding: "Embedding content",
+    stageTransforming: "Generating insights",
+    stageCompleted: "Completed",
+    stageFailed: "Failed",
     failedToLoad: "Failed to load sources",
     allSourcesDesc: "View all your sources here. You can add new sources or manage existing ones.",
     allSources: "All Sources",
@@ -460,6 +466,31 @@ export const enUS = {
     sessionCreated: "Chat session created",
     sessionUpdated: "Session updated",
     sessionDeleted: "Session deleted",
+    // Q&A cache badge shown on AI messages served from the answer cache.
+    // Regenerate re-runs the LLM and overwrites the cached answer.
+    cachedLabel: "Cached",
+    cachedTooltip: "This answer was served from the cache. Click Regenerate to run the model again.",
+    regenerate: "Regenerate",
+    // Perplexity-style retrieval preview chips rendered above each AI
+    // bubble. `retrievedSources` is the row header ("Retrieved 4 sources");
+    // `matchVector` / `matchText` describe *why* a chunk was surfaced and
+    // show up in the chip tooltip.
+    retrievedSources: "Retrieved {count} sources",
+    matchVector: "Semantic",
+    matchText: "Keyword",
+    // Cycling status messages shown by <ThinkingIndicator/> while the model
+    // composes a response. Ordered loosely from "just started" to "wrapping
+    // up". Non-English locales inherit these via i18next's fallback until
+    // translated — keep them short (≤30 chars) so they fit on one line.
+    thinking: {
+      reading: "Reading your sources...",
+      pondering: "Pondering...",
+      connecting: "Connecting the dots...",
+      consulting: "Consulting insights...",
+      cross_referencing: "Cross-referencing notes...",
+      brewing: "Brewing a response...",
+      almost: "Almost there...",
+    },
   },
   searchPage: {
     askAndSearch: "Ask and Search",

@@ -79,6 +79,7 @@ class ModelResponse(BaseModel):
     provider: str
     type: str
     credential: Optional[str] = None
+    credential_disabled: bool = False
     created: str
     updated: str
 
@@ -294,7 +295,11 @@ class SourceCreate(BaseModel):
     content: Optional[str] = Field(None, description="Text content for text type")
     title: Optional[str] = Field(None, description="Source title")
     transformations: Optional[List[str]] = Field(
-        default_factory=list, description="Transformation IDs to apply"
+        default_factory=list,
+        description=(
+            "Transformation IDs to apply. If omitted or empty, every "
+            "transformation with apply_default=True is applied automatically."
+        ),
     )
     embed: bool = Field(False, description="Whether to embed content for vector search")
     delete_source: bool = Field(
@@ -618,6 +623,8 @@ class CredentialResponse(BaseModel):
     updated: str
     model_count: int = 0
     decryption_error: Optional[str] = None
+    disabled: bool = False
+    last_test_message: Optional[str] = None
 
 
 class CredentialDeleteResponse(BaseModel):

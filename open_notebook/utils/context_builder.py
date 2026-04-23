@@ -84,6 +84,13 @@ class ContextBuilder:
         self.include_insights: bool = kwargs.get("include_insights", True)
         self.include_notes: bool = kwargs.get("include_notes", True)
         self.max_tokens: Optional[int] = kwargs.get("max_tokens")
+        # Inclusion level controls whether source.full_text is pulled into
+        # context. "insights" (default) returns only id/title/insights — fine
+        # for notebook-wide context where we rely on embeddings + insights.
+        # Source-level chat wants the raw content and must pass "full content".
+        self.source_inclusion_level: str = kwargs.get(
+            "source_inclusion_level", "insights"
+        )
 
         # Context configuration
         context_config_arg: Optional[ContextConfig] = kwargs.get("context_config")
@@ -117,7 +124,9 @@ class ContextBuilder:
 
             # Build context based on parameters
             if self.source_id:
-                await self._add_source_context(self.source_id)
+                await self._add_source_context(
+                    self.source_id, inclusion_level=self.source_inclusion_level
+                )
 
             if self.notebook_id:
                 await self._add_notebook_context(self.notebook_id)

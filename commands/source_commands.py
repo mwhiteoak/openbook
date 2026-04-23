@@ -8,7 +8,7 @@ from surreal_commands import CommandInput, CommandOutput, command
 from open_notebook.database.repository import ensure_record_id
 from open_notebook.domain.notebook import Source
 from open_notebook.domain.transformation import Transformation
-from open_notebook.exceptions import ConfigurationError
+from open_notebook.exceptions import ConfigurationError, NotFoundError
 
 try:
     from open_notebook.graphs.source import source_graph
@@ -54,7 +54,11 @@ class SourceProcessingOutput(CommandOutput):
         "wait_strategy": "exponential_jitter",
         "wait_min": 1,
         "wait_max": 120,  # Allow queue to drain
-        "stop_on": [ValueError, ConfigurationError],  # Don't retry validation/config errors
+        # Don't retry validation/config errors. NotFoundError is also terminal:
+        # if the source was deleted between submission and execution, retrying
+        # 15× with exponential backoff just starves the worker's concurrency
+        # budget (max_tasks=5) and blocks unrelated embed_source jobs.
+        "stop_on": [ValueError, ConfigurationError, NotFoundError],
         "retry_log_level": "debug",  # Avoid log noise during transaction conflicts
     },
 )

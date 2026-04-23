@@ -1,0 +1,22 @@
+-- Migration 18: Notebook-level running summary
+--
+-- Stores a compact, LLM-maintained summary of the notebook's activity
+-- (themes, open questions, decisions made). The chat graph injects this
+-- into the system prompt so the model retains long-term "notebook memory"
+-- even when a single chat session is short or has just been created.
+--
+-- The summary is refreshed asynchronously after each chat turn, gated by
+-- `running_summary_msg_count` so we only pay the LLM cost once every N
+-- new messages (default batch: 8). Keeping the batched count in the row
+-- instead of recomputing it from chat_session history avoids an extra
+-- query on the hot write path.
+--
+-- All fields are optional: old notebooks just return None until the first
+-- chat turn lands and the background job populates them.
+
+DEFINE FIELD IF NOT EXISTS running_summary ON TABLE notebook TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS running_summary_updated ON TABLE notebook TYPE option<datetime>;
+-- Count of chat messages (across all sessions in this notebook) that were
+-- already folded into running_summary. New messages above this threshold
+-- trigger a refresh.
+DEFINE FIELD IF NOT EXISTS running_summary_msg_count ON TABLE notebook TYPE option<int> DEFAULT 0;

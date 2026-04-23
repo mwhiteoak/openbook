@@ -1,7 +1,10 @@
 'use client'
 
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { SourceListResponse } from '@/lib/types/api'
+import { sourcesApi } from '@/lib/api/sources'
+import { QUERY_KEYS } from '@/lib/api/query-client'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -198,6 +201,22 @@ export function SourceCard({
     }
   }
 
+  // Prefetch the full source detail (used by the source modal on open) once
+  // the user signals intent by hovering/focusing the card. Fire-and-forget;
+  // the modal will re-read from the TanStack cache and render instantly if
+  // this completes first, or refetch on mount otherwise.
+  const queryClient = useQueryClient()
+  const hasPrefetchedRef = useRef(false)
+  const handlePrefetch = () => {
+    if (hasPrefetchedRef.current) return
+    hasPrefetchedRef.current = true
+    queryClient.prefetchQuery({
+      queryKey: QUERY_KEYS.source(source.id),
+      queryFn: () => sourcesApi.get(source.id),
+      staleTime: 30 * 1000,
+    }).catch(() => { /* silent — latency hint only */ })
+  }
+
   const isProcessing: boolean = currentStatus === 'new' || currentStatus === 'running' || currentStatus === 'queued'
   const isFailed: boolean = currentStatus === 'failed'
   const isCompleted: boolean = currentStatus === 'completed'
@@ -209,6 +228,8 @@ export function SourceCard({
         className
       )}
       onClick={handleCardClick}
+      onMouseEnter={handlePrefetch}
+      onFocus={handlePrefetch}
     >
       <CardContent className="px-3 py-1">
         {/* Header with status indicator */}
@@ -371,22 +392,43 @@ export function SourceCard({
           </div>
         )}
 
-        {/* Processing progress indicator */}
-        {isProcessing && statusData?.processing_info?.progress && (
-          <div className="mt-3 pt-2 border-t">
-            <div className="flex justify-between items-center mb-1">
-            <span className="text-xs text-gray-600">{t('common.progress')}</span>
-              <span className="text-xs text-gray-600">
-                {Math.round(statusData.processing_info.progress as number)}%
-              </span>
-            </div>
-            <div className="w-full bg-gray-200 rounded-full h-1.5">
-              <div
-                className="bg-blue-600 h-1.5 rounded-full transition-all duration-300"
-                style={{ width: `${statusData.processing_info.progress as number}%` }}
-              />
-            </div>
-          </div>
+        {/* Processing progress indicator.
+            The backend computes `progress` (0–100 int) and `stage` (one of
+            queued / extracting / embedding / transforming / completed / failed)
+            in Source.get_processing_progress. Stage labels come from i18n —
+            see sources.stage* keys. We render whenever a numeric progress
+            value is present, even if it's 0 (queued), so the user gets
+            immediate feedback that their upload was accepted. */}
+        {isProcessing && typeof statusData?.processing_info?.progress === 'number' && (
+          (() => {
+            const pi = statusData.processing_info as { progress: number; stage?: string }
+            const pct = Math.max(0, Math.min(100, Math.round(pi.progress)))
+            const stage = typeof pi.stage === 'string' ? pi.stage : undefined
+            const stageKey = stage
+              ? `sources.stage${stage.charAt(0).toUpperCase()}${stage.slice(1)}`
+              : null
+            const stageLabel = stageKey ? t(stageKey) : t('common.progress')
+            return (
+              <div className="mt-3 pt-2 border-t">
+                <div className="flex justify-between items-center mb-1">
+                  <span className="text-xs text-gray-600">{stageLabel}</span>
+                  <span className="text-xs text-gray-600">{pct}%</span>
+                </div>
+                <div
+                  className="w-full bg-gray-200 rounded-full h-1.5"
+                  role="progressbar"
+                  aria-valuenow={pct}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                >
+                  <div
+                    className="bg-blue-600 h-1.5 rounded-full transition-all duration-500 ease-out"
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+              </div>
+            )
+          })()
         )}
       </CardContent>
     </Card>

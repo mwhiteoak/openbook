@@ -1,0 +1,66 @@
+-- Migration 17: Chat Q&A cache
+--
+-- Stores previously answered questions so subsequent asks of the same (or
+-- semantically similar) question within the same scope + context can skip
+-- a fresh LLM roundtrip. Reduces latency and token spend on repeated
+-- questions across sessions.
+--
+-- Scope is either a notebook_id OR a source_id (mutually exclusive — set
+-- the one that applies to the chat surface). Context fingerprint is a hash
+-- of the exact inputs the LLM saw (selected sources, their modes, model,
+-- max(source.updated)); when any of those change the cache is considered
+-- stale and the lookup returns nothing.
+--
+-- Table is intentionally schemaful so field types are enforced.
+
+DEFINE TABLE IF NOT EXISTS chat_qa_cache SCHEMAFULL;
+
+-- The user's question text (raw, used for exact-match lookup).
+DEFINE FIELD IF NOT EXISTS question ON TABLE chat_qa_cache TYPE string;
+-- Normalized form (lowercased, whitespace-collapsed) for exact match.
+DEFINE FIELD IF NOT EXISTS question_norm ON TABLE chat_qa_cache TYPE string;
+-- Embedding of the question for semantic match.
+DEFINE FIELD IF NOT EXISTS question_embedding ON TABLE chat_qa_cache TYPE option<array<float>>;
+-- The answer text we stored.
+DEFINE FIELD IF NOT EXISTS answer ON TABLE chat_qa_cache TYPE string;
+
+-- Scope — exactly one of these is set per row.
+DEFINE FIELD IF NOT EXISTS notebook_id ON TABLE chat_qa_cache TYPE option<record<notebook>>;
+DEFINE FIELD IF NOT EXISTS source_id ON TABLE chat_qa_cache TYPE option<record<source>>;
+
+-- Hash of (context_config, model_id, max source.updated). Identical
+-- fingerprint means the LLM would have seen the same context for both
+-- questions, so serving a cached answer is safe.
+DEFINE FIELD IF NOT EXISTS context_fingerprint ON TABLE chat_qa_cache TYPE string;
+
+-- Which chat model produced the answer. Included in the fingerprint, but
+-- stored separately for debugging / cache-by-model analytics.
+DEFINE FIELD IF NOT EXISTS model_id ON TABLE chat_qa_cache TYPE option<string>;
+
+-- How many times this entry has been served. Bumped on each hit.
+DEFINE FIELD IF NOT EXISTS hit_count ON TABLE chat_qa_cache TYPE int DEFAULT 0;
+
+-- Standard timestamps.
+DEFINE FIELD IF NOT EXISTS created ON TABLE chat_qa_cache TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS updated ON TABLE chat_qa_cache TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS last_hit_at ON TABLE chat_qa_cache TYPE option<datetime>;
+
+-- Fast exact lookup: same notebook + same context + same normalized question
+-- is the 99% hot path. Not UNIQUE because the same question across different
+-- fingerprints is legitimate (e.g. user changes model mid-conversation).
+DEFINE INDEX IF NOT EXISTS idx_chat_qa_notebook_lookup
+    ON TABLE chat_qa_cache COLUMNS notebook_id, context_fingerprint, question_norm;
+
+DEFINE INDEX IF NOT EXISTS idx_chat_qa_source_lookup
+    ON TABLE chat_qa_cache COLUMNS source_id, context_fingerprint, question_norm;
+
+-- Scope-only index powers the semantic fallback (select candidates by scope
+-- + fingerprint, then rank by cosine similarity in the query).
+DEFINE INDEX IF NOT EXISTS idx_chat_qa_notebook_scope
+    ON TABLE chat_qa_cache COLUMNS notebook_id, context_fingerprint;
+
+DEFINE INDEX IF NOT EXISTS idx_chat_qa_source_scope
+    ON TABLE chat_qa_cache COLUMNS source_id, context_fingerprint;
+
+-- TTL cleanup query filters by created desc.
+DEFINE INDEX IF NOT EXISTS idx_chat_qa_created ON TABLE chat_qa_cache COLUMNS created;

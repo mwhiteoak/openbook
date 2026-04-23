@@ -1,0 +1,29 @@
+-- Migration 16: Indexes for hot list queries
+-- Adds indexes that speed up the sources/notes/notebooks list endpoints
+-- and the notebook reference graph traversal used to render a notebook's
+-- sources/notes. CONCURRENTLY is used so existing data keeps serving reads
+-- while the index is built.
+
+-- Per-user filtering on core tables
+DEFINE INDEX IF NOT EXISTS idx_source_user_id ON TABLE source COLUMNS user_id CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_note_user_id ON TABLE note COLUMNS user_id CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_notebook_user_id ON TABLE notebook COLUMNS user_id CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_chat_session_user_id ON TABLE chat_session COLUMNS user_id CONCURRENTLY;
+
+-- Sort columns used by ORDER BY in list endpoints
+DEFINE INDEX IF NOT EXISTS idx_source_updated ON TABLE source COLUMNS updated CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_source_created ON TABLE source COLUMNS created CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_note_updated ON TABLE note COLUMNS updated CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_notebook_updated ON TABLE notebook COLUMNS updated CONCURRENTLY;
+
+-- Graph edge lookups used to render a notebook's sources/notes
+DEFINE INDEX IF NOT EXISTS idx_reference_out ON TABLE reference COLUMNS out CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_reference_in ON TABLE reference COLUMNS in CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_artifact_out ON TABLE artifact COLUMNS out CONCURRENTLY;
+DEFINE INDEX IF NOT EXISTS idx_artifact_in ON TABLE artifact COLUMNS in CONCURRENTLY;
+
+-- Command FETCH used when listing sources with processing status
+DEFINE INDEX IF NOT EXISTS idx_source_command ON TABLE source COLUMNS command CONCURRENTLY;
+
+-- Model -> credential lookup (every chat turn reads this)
+DEFINE INDEX IF NOT EXISTS idx_model_credential ON TABLE model COLUMNS credential CONCURRENTLY;

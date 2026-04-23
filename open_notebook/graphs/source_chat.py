@@ -1,11 +1,11 @@
 import asyncio
-import sqlite3
 from typing import Annotated, Dict, List, Optional
 
+import aiosqlite
 from ai_prompter import Prompter
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
@@ -23,27 +23,26 @@ from open_notebook.utils.text_utils import extract_text_content
 class SourceChatState(TypedDict):
     messages: Annotated[list, add_messages]
     source_id: str
-    source: Optional[Source]
-    insights: Optional[List[SourceInsight]]
+    # NOTE: do NOT persist Source / SourceInsight pydantic objects here —
+    # AsyncSqliteSaver serializes checkpoints with msgpack, which rejects
+    # arbitrary pydantic models. We rebuild them from source_id inside the
+    # node, so they only need to live as locals.
     context: Optional[str]
     model_override: Optional[str]
     context_indicators: Optional[Dict[str, List[str]]]
 
 
-def call_model_with_source_context(
+async def call_model_with_source_context(
     state: SourceChatState, config: RunnableConfig
 ) -> dict:
-    """
-    Main function that builds source context and calls the model.
+    """Native async source-chat node.
 
-    This function:
-    1. Uses ContextBuilder to build source-specific context
-    2. Applies the source_chat Jinja2 prompt template
-    3. Handles model provisioning with override support
-    4. Tracks context indicators for referenced insights/content
+    Runs on the FastAPI event loop — no ThreadPoolExecutor, no nested event
+    loops. Builds source context once via ContextBuilder and reuses typed
+    objects directly instead of re-hydrating them from the dict.
     """
     try:
-        return _call_model_with_source_context_inner(state, config)
+        return await _call_model_with_source_context_inner(state, config)
     except OpenNotebookError:
         raise
     except Exception as e:
@@ -51,67 +50,69 @@ def call_model_with_source_context(
         raise error_class(user_message) from e
 
 
-def _call_model_with_source_context_inner(
+async def _call_model_with_source_context_inner(
     state: SourceChatState, config: RunnableConfig
 ) -> dict:
     source_id = state.get("source_id")
     if not source_id:
         raise ValueError("source_id is required in state")
 
-    # Build source context using ContextBuilder (run async code in new loop)
-    def build_context():
-        """Build context in a new event loop"""
-        new_loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(new_loop)
-            context_builder = ContextBuilder(
-                source_id=source_id,
-                include_insights=True,
-                include_notes=False,  # Focus on source-specific content
-                max_tokens=50000,  # Reasonable limit for source context
-            )
-            return new_loop.run_until_complete(context_builder.build())
-        finally:
-            new_loop.close()
-            asyncio.set_event_loop(None)
+    # Build source context using ContextBuilder — directly awaitable, no loop
+    # gymnastics, and uses the shared SurrealDB connection pool.
+    context_builder = ContextBuilder(
+        source_id=source_id,
+        include_insights=True,
+        include_notes=False,  # Focus on source-specific content
+        # Source chat needs the raw document text in context so the LLM can
+        # answer content-specific questions (e.g. "how much is the quote?").
+        # Default "insights" level omits full_text — leaving the model with
+        # just the title. "full content" pulls full_text into the payload.
+        source_inclusion_level="full content",
+        max_tokens=50000,  # Reasonable limit for source context
+    )
+    context_data = await context_builder.build()
 
-    # Get the built context
-    try:
-        # Try to get the current event loop
-        asyncio.get_running_loop()
-        # If we're in an event loop, run in a thread with a new loop
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(build_context)
-            context_data = future.result()
-    except RuntimeError:
-        # No event loop running, safe to create a new one
-        context_data = build_context()
-
-    # Extract source and insights from context
-    source = None
-    insights = []
-    context_indicators: dict[str, list[str | None]] = {
+    # Re-use the typed ContextItem objects the builder already constructed
+    # instead of hydrating fresh Source/SourceInsight pydantic models from the
+    # dict payload a second time.
+    source: Optional[Source] = None
+    insights: List[SourceInsight] = []
+    context_indicators: Dict[str, List[str]] = {
         "sources": [],
         "insights": [],
         "notes": [],
     }
 
-    if context_data.get("sources"):
-        source_info = context_data["sources"][0]  # First source
-        source = Source(**source_info) if isinstance(source_info, dict) else source_info
-        context_indicators["sources"].append(source.id)
-
-    if context_data.get("insights"):
-        for insight_data in context_data["insights"]:
-            insight = (
-                SourceInsight(**insight_data)
-                if isinstance(insight_data, dict)
-                else insight_data
-            )
-            insights.append(insight)
-            context_indicators["insights"].append(insight.id)
+    for item in context_builder.items:
+        if item.type == "source":
+            # Items store the raw context dict; we only need the id for
+            # indicators, and `get_source_reference()` uses `source.id` only
+            # through domain calls the template is not making.  Keep a minimal
+            # reference so the template can still call `.model_dump()`.
+            if item.id:
+                context_indicators["sources"].append(item.id)
+            # Lazy-load the actual domain object only if prompt needs it
+            if source is None and item.id:
+                try:
+                    source = await Source.get(item.id)
+                except Exception:
+                    source = None
+        elif item.type == "insight":
+            if item.id:
+                context_indicators["insights"].append(item.id)
+            content = item.content or {}
+            try:
+                insights.append(
+                    SourceInsight(
+                        id=content.get("id"),
+                        insight_type=content.get("insight_type"),
+                        content=content.get("content"),
+                    )
+                )
+            except Exception:
+                # Fall back to raw dict-based attribute access if SourceInsight
+                # validation fails for any reason.
+                continue
 
     # Format context for the prompt
     formatted_context = _format_source_context(context_data)
@@ -130,58 +131,26 @@ def _call_model_with_source_context_inner(
     )
     payload = [SystemMessage(content=system_prompt)] + state.get("messages", [])
 
-    # Handle async model provisioning from sync context
-    def run_in_new_loop():
-        """Run the async function in a new event loop"""
-        new_loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(new_loop)
-            return new_loop.run_until_complete(
-                provision_langchain_model(
-                    str(payload),
-                    config.get("configurable", {}).get("model_id")
-                    or state.get("model_override"),
-                    "chat",
-                    max_tokens=8192,
-                )
-            )
-        finally:
-            new_loop.close()
-            asyncio.set_event_loop(None)
+    model_id = config.get("configurable", {}).get("model_id") or state.get(
+        "model_override"
+    )
+    model = await provision_langchain_model(
+        str(payload), model_id, "chat", max_tokens=8192
+    )
 
-    try:
-        # Try to get the current event loop
-        asyncio.get_running_loop()
-        # If we're in an event loop, run in a thread with a new loop
-        import concurrent.futures
+    ai_message = await model.ainvoke(payload)
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(run_in_new_loop)
-            model = future.result()
-    except RuntimeError:
-        # No event loop running, safe to use asyncio.run()
-        model = asyncio.run(
-            provision_langchain_model(
-                str(payload),
-                config.get("configurable", {}).get("model_id")
-                or state.get("model_override"),
-                "chat",
-                max_tokens=8192,
-            )
-        )
-
-    ai_message = model.invoke(payload)
-
-    # Clean thinking content from AI response (e.g., <think>...</think> tags)
+    # Clean thinking content from AI response (e.g. <think>...</think> tags)
     content = extract_text_content(ai_message.content)
     cleaned_content = clean_thinking_content(content)
     cleaned_message = ai_message.model_copy(update={"content": cleaned_content})
 
-    # Update state with context information
+    # Intentionally omit `source` / `insights` — they're pydantic objects and
+    # AsyncSqliteSaver's msgpack serializer can't encode them. They're purely
+    # local to this node (rebuilt from source_id every call), so dropping them
+    # from the returned state dict prevents checkpoint-write failures.
     return {
         "messages": cleaned_message,
-        "source": source,
-        "insights": insights,
         "context": formatted_context,
         "context_indicators": context_indicators,
     }
@@ -240,16 +209,35 @@ def _format_source_context(context_data: Dict) -> str:
     return "\n".join(context_parts)
 
 
-# Create SQLite checkpointer
-conn = sqlite3.connect(
-    LANGGRAPH_CHECKPOINT_FILE,
-    check_same_thread=False,
-)
-memory = SqliteSaver(conn)
-
-# Create the StateGraph
+# Uncompiled graph definition — safe at import time.
 source_chat_state = StateGraph(SourceChatState)
 source_chat_state.add_node("source_chat_agent", call_model_with_source_context)
 source_chat_state.add_edge(START, "source_chat_agent")
 source_chat_state.add_edge("source_chat_agent", END)
-source_chat_graph = source_chat_state.compile(checkpointer=memory)
+
+
+# Lazy async checkpointer + compiled graph.
+#
+# See open_notebook/graphs/chat.py for the full rationale — sync `SqliteSaver`
+# raises NotImplementedError on every async method, which broke `ainvoke` and
+# `astream_events` for source chat. We use `AsyncSqliteSaver` which must be
+# constructed inside a running event loop, hence the lazy factory.
+_graph = None
+_graph_lock: Optional[asyncio.Lock] = None
+
+
+async def get_source_chat_graph():
+    """Return the compiled source-chat graph, building it on first call."""
+    global _graph, _graph_lock
+    if _graph is not None:
+        return _graph
+    if _graph_lock is None:
+        _graph_lock = asyncio.Lock()
+    async with _graph_lock:
+        if _graph is not None:
+            return _graph
+        conn = await aiosqlite.connect(LANGGRAPH_CHECKPOINT_FILE)
+        memory = AsyncSqliteSaver(conn)
+        await memory.setup()
+        _graph = source_chat_state.compile(checkpointer=memory)
+    return _graph

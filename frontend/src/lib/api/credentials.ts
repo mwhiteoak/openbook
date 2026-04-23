@@ -21,6 +21,8 @@ export interface Credential {
   updated: string
   model_count: number
   decryption_error?: string | null
+  disabled?: boolean
+  last_test_message?: string | null
 }
 
 export interface CreateCredentialRequest {

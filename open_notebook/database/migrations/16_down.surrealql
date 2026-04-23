@@ -1,0 +1,20 @@
+-- Rollback migration 16: drop list-query indexes
+
+REMOVE INDEX IF EXISTS idx_source_user_id ON TABLE source;
+REMOVE INDEX IF EXISTS idx_note_user_id ON TABLE note;
+REMOVE INDEX IF EXISTS idx_notebook_user_id ON TABLE notebook;
+REMOVE INDEX IF EXISTS idx_chat_session_user_id ON TABLE chat_session;
+
+REMOVE INDEX IF EXISTS idx_source_updated ON TABLE source;
+REMOVE INDEX IF EXISTS idx_source_created ON TABLE source;
+REMOVE INDEX IF EXISTS idx_note_updated ON TABLE note;
+REMOVE INDEX IF EXISTS idx_notebook_updated ON TABLE notebook;
+
+REMOVE INDEX IF EXISTS idx_reference_out ON TABLE reference;
+REMOVE INDEX IF EXISTS idx_reference_in ON TABLE reference;
+REMOVE INDEX IF EXISTS idx_artifact_out ON TABLE artifact;
+REMOVE INDEX IF EXISTS idx_artifact_in ON TABLE artifact;
+
+REMOVE INDEX IF EXISTS idx_source_command ON TABLE source;
+
+REMOVE INDEX IF EXISTS idx_model_credential ON TABLE model;

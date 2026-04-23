@@ -1,0 +1,9 @@
+-- Rollback migration 17: drop chat Q&A cache table and its indexes.
+
+REMOVE INDEX IF EXISTS idx_chat_qa_created ON TABLE chat_qa_cache;
+REMOVE INDEX IF EXISTS idx_chat_qa_source_scope ON TABLE chat_qa_cache;
+REMOVE INDEX IF EXISTS idx_chat_qa_notebook_scope ON TABLE chat_qa_cache;
+REMOVE INDEX IF EXISTS idx_chat_qa_source_lookup ON TABLE chat_qa_cache;
+REMOVE INDEX IF EXISTS idx_chat_qa_notebook_lookup ON TABLE chat_qa_cache;
+
+REMOVE TABLE IF EXISTS chat_qa_cache;
