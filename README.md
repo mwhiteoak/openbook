@@ -38,18 +38,6 @@
 <a href="https://trendshift.io/repositories/14536" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14536" alt="lfnovo%2Fopen-notebook | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>
 
-<div align="center">
-  <!-- Keep these links. Translations will automatically update with the README. -->
-  <a href="https://zdoc.app/de/lfnovo/open-notebook">Deutsch</a> | 
-  <a href="https://zdoc.app/es/lfnovo/open-notebook">Español</a> | 
-  <a href="https://zdoc.app/fr/lfnovo/open-notebook">français</a> | 
-  <a href="https://zdoc.app/ja/lfnovo/open-notebook">日本語</a> | 
-  <a href="https://zdoc.app/ko/lfnovo/open-notebook">한국어</a> | 
-  <a href="https://zdoc.app/pt/lfnovo/open-notebook">Português</a> | 
-  <a href="https://zdoc.app/ru/lfnovo/open-notebook">Русский</a> | 
-  <a href="https://zdoc.app/zh/lfnovo/open-notebook">中文</a>
-</div>
-
 ## A private, multi-model, 100% local, full-featured alternative to Notebook LM
 
 ![New Notebook](docs/assets/asset_list.png)
@@ -62,8 +50,7 @@ In a world dominated by Artificial Intelligence, having the ability to think �
 - 📚 **Organize multi-modal content** - PDFs, videos, audio, web pages, and more
 - 🎙️ **Generate professional podcasts** - Advanced multi-speaker podcast generation
 - 🔍 **Search intelligently** - Full-text and vector search across all your content
-- 💬 **Chat with context** - AI conversations powered by your research
-- 🌐 **Multi-language UI** - English, Portuguese, Chinese (Simplified & Traditional), Japanese, Russian, and Bengali support
+- 💬 **Chat with context** - Hybrid retrieval, reranking, and citation-verified answers grounded in your research
 
 Learn more about our project at [https://www.open-notebook.ai](https://www.open-notebook.ai)
 
@@ -231,6 +218,20 @@ Thanks to the [Esperanto](https://github.com/lfnovo/esperanto) library, we suppo
 - **💬 Context-Aware Chat**: AI conversations powered by your research materials
 - **📝 AI-Assisted Notes**: Generate insights or write notes manually
 
+### Retrieval & Chat Quality
+- **🧬 Hybrid Retrieval (BM25 + Vector with RRF)**: Combines keyword and semantic search via Reciprocal Rank Fusion (k=60) so answers aren't skewed by embedding drift or literal keyword gaps
+- **🎯 Cross-Encoder Reranking**: Retrieves top-20 candidates then reranks to the best 5, dramatically improving answer grounding
+- **🔁 Follow-up Rewriting**: Conversational follow-ups are rewritten into self-contained retrieval queries so "and what about the second one?" still finds the right chunks
+- **🔎 Perplexity-Style Retrieval Preview**: See the chunks the model is reading *before* it answers, so you can verify grounding at a glance
+- **✅ Citation Verification**: Every claim is checked against the cited chunk before being shown — hallucinated citations are filtered out
+- **🧠 Smart Model Routing**: Automatically routes simple questions to fast/cheap models and complex reasoning to larger models
+- **🗒️ Notebook Running Summary**: Maintains a rolling summary of each notebook to ground future chats in prior context without replaying full history
+- **⚡ LLM-Verified Semantic Cache**: Cached answers are re-validated for relevance before being served — fast *and* accurate
+
+### Content Processing
+- **📊 Source Ingestion Progress Bar**: Real-time per-stage progress (queued → extracting → embedding → transforming → completed) with ARIA-accessible UI
+- **💡 Auto-Generated Insights on Upload**: New sources are automatically summarized and tagged with key insights — no manual transformation step required
+
 ### Advanced Features
 - **⚡ Reasoning Model Support**: Full support for thinking models like DeepSeek-R1 and Qwen3
 - **🔧 Content Transformations**: Powerful customizable actions to summarize and extract insights
@@ -280,6 +281,20 @@ Thanks to the [Esperanto](https://github.com/lfnovo/esperanto) library, we suppo
 - **Bookmark Integration**: Connect with your favorite bookmarking apps
 
 ### Recently Completed ✅
+
+**Chat & Retrieval Overhaul** (latest):
+- **Hybrid Retrieval with RRF**: BM25 keyword + vector semantic search fused via Reciprocal Rank Fusion
+- **Cross-Encoder Reranking**: Top-20 → top-5 reranking for dramatically better grounding
+- **Follow-up Query Rewriting**: Conversational follow-ups rewritten into self-contained retrieval queries
+- **Retrieval Preview UI**: Perplexity-style view of retrieved chunks before the model answers
+- **Citation Verification**: Every cited claim is verified against its source chunk before display
+- **Auto-Insights on Source Upload**: New sources automatically summarized and tagged
+- **Source Ingestion Progress Bar**: Real-time per-stage progress with ARIA accessibility
+- **Smart Model Routing**: Simple questions go to fast/cheap models, complex reasoning to larger models
+- **Notebook Running Summary**: Rolling notebook summary keeps chats grounded without full history replay
+- **LLM-Verified Semantic Cache**: Cached answers re-validated for relevance before serving
+
+**Earlier releases**:
 - **Next.js Frontend**: Modern React-based frontend with improved performance
 - **Comprehensive REST API**: Full programmatic access to all functionality
 - **Multi-Model Support**: 18+ AI providers including OpenAI, Anthropic, Ollama, LM Studio
